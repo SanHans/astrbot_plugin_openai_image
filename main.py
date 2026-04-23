@@ -31,7 +31,7 @@ NATURAL_LANGUAGE_PATTERNS = (
 NATURAL_LANGUAGE_EXCLUDED_PREFIXES = ("重点", "个重点", "重点画", "线", "圈", "标记")
 
 
-@register("OpenAIImage", "Codex", "使用 OpenAI 兼容接口生成图片", "1.0.1")
+@register("OpenAIImage", "SanHans", "使用 OpenAI 兼容接口生成图片", "1.0.1")
 class OpenAIImagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
