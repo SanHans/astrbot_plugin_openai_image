@@ -25,36 +25,7 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-image-2"
-DEFAULT_NATURAL_LANGUAGE_POLISH_PROMPT_TEMPLATE = """你是 AstrBot 画图插件的自然语言提示词整理器。
-请把“用户原话”整理成适合图像生成模型直接使用的最终提示词。
-
-规则：
-1. prompt 必须保留用户本意，只做轻度润色和必要补全，不得擅自改变主体、动作、关系、场景、风格、时代、情绪和媒介。
-2. 如果用户没有明确指定风格，不要擅自添加二次元、写实、电影感、赛博朋克等强风格词。
-3. 不要添加大量画质、镜头、构图、光照标签，不要把简单需求扩写成堆砌关键词。
-4. 输出必须只有最终提示词本身，不要解释，不要 JSON，不要 Markdown，不要代码块，不要额外客套话。
-
-平台类型：
-{{platform_name}}
-
-用户原话：
-{{user_prompt}}
-"""
 COMMAND_NAMES = {"画图", "draw", "image", "绘图"}
-NATURAL_LANGUAGE_PATTERNS = (
-    re.compile(r"^\s*画图[:：\s]*(?P<prompt>.+?)\s*$", re.IGNORECASE),
-    re.compile(r"^\s*(?:请|请你)?(?:帮我|给我|替我|麻烦你)\s*画(?P<prompt>.+?)\s*$", re.IGNORECASE),
-    re.compile(r"^\s*(?:请|请你)?(?:帮我|给我|替我|麻烦你)?画(?:一张|个|幅|张)图?\s*(?P<prompt>.+?)\s*$", re.IGNORECASE),
-    re.compile(
-        r"^\s*(?:请|请你)?(?:帮我|给我|替我|麻烦你)?(?:生成|做)(?:一张|个|幅)?(?:图片|图像|图)\s*(?P<prompt>.+?)\s*$",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"^\s*(?:请|请你)?(?:帮我|给我|替我|麻烦你)?绘制(?:一张|个|幅)?(?:图片|图像|图)?\s*(?P<prompt>.+?)\s*$",
-        re.IGNORECASE,
-    ),
-)
-NATURAL_LANGUAGE_EXCLUDED_PREFIXES = ("重点", "个重点", "重点画", "线", "圈", "标记")
 
 
 @pydantic_dataclass
@@ -62,14 +33,14 @@ class GenerateImageTool(FunctionTool[AstrAgentContext]):
     """根据用户描述生成图片，并在完成后推送到当前会话。"""
 
     name: str = "generate_image"
-    description: str = "使用图像模型生成图片"
+    description: str = "当用户要求你画图、生成图片、制作插画或配图时调用。图片会在生成完成后自动发送到当前会话，你可以继续按当前人格口吻回复用户。"
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "将用户的画图需求尽量原样传给生图模型。除非用户明确要求，否则不要主动添加新的风格、构图、光照、背景、画质标签或其他会改变语义侧重点的描述。",
+                    "description": "将用户的画图需求尽量原样传给生图模型。除非用户明确要求，否则不要主动添加新的风格、构图、光照、背景、画质标签或其他会改变语义侧重点的描述。用户只是自然地说“帮我画一只猫”时，也应该直接提炼成生图提示词并调用本工具。",
                 }
             },
             "required": ["prompt"],
@@ -112,10 +83,10 @@ class GenerateImageTool(FunctionTool[AstrAgentContext]):
             )
         except ValueError as exc:
             return str(exc)
-        return "我会按用户的描述生成图片，并在完成后直接把结果发送到当前会话。"
+        return "图像生成任务已启动，结果会在完成后自动发送到当前会话。"
 
 
-@register("OpenAIImage", "SanHans", "使用 OpenAI 兼容接口生成图片", "1.0.5")
+@register("OpenAIImage", "SanHans", "使用 OpenAI 兼容接口生成图片", "1.0.7")
 class OpenAIImagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -285,101 +256,6 @@ class OpenAIImagePlugin(Star):
 
         reconstructed = " ".join(tokens).strip()
         return self._cleanup_prompt(reconstructed or raw_prompt)
-
-    def _extract_natural_prompt(self, message: str) -> str | None:
-        text = str(message or "").strip()
-        if not text:
-            return None
-
-        if text.startswith(("/", "!", ".", "#")):
-            return None
-
-        for pattern in NATURAL_LANGUAGE_PATTERNS:
-            match = pattern.match(text)
-            if not match:
-                continue
-
-            prompt = self._cleanup_prompt(match.group("prompt"))
-            if prompt and not prompt.startswith(NATURAL_LANGUAGE_EXCLUDED_PREFIXES):
-                return prompt
-
-        return None
-
-    @staticmethod
-    def _sanitize_polished_prompt(text: str) -> str:
-        prompt = re.sub(r"<think>[\s\S]*?</think>", "", text or "", flags=re.IGNORECASE).strip()
-        prompt = re.sub(r"^(prompt|提示词)\s*[:：]\s*", "", prompt, flags=re.IGNORECASE).strip()
-        if prompt.startswith(("```", '"""', "'''")):
-            prompt = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", prompt).strip()
-            prompt = re.sub(r"\n?```$", "", prompt).strip()
-            prompt = prompt.strip('"\'')
-        return prompt.strip().strip('"\'')
-
-    def _render_natural_language_polish_prompt(
-        self,
-        prompt: str,
-        platform_name: str,
-    ) -> str:
-        template = str(
-            self.config.get("natural_language_polish_prompt_template")
-            or DEFAULT_NATURAL_LANGUAGE_POLISH_PROMPT_TEMPLATE
-        ).strip()
-        return (
-            template.replace("{{user_prompt}}", prompt)
-            .replace("{{platform_name}}", platform_name or "unknown")
-        )
-
-    async def _polish_natural_language_prompt(
-        self,
-        event: AstrMessageEvent,
-        prompt: str,
-    ) -> tuple[str, str | None]:
-        platform_context = self._get_platform_context(event)
-        provider = self.context.get_using_provider(umo=event.unified_msg_origin)
-        if not provider:
-            self._log_detail("warning", "OpenAIImage no provider found for natural language polishing; fallback to raw prompt")
-            return prompt, self.config.get("natural_language_fallback_reply", "好，我来画这个。")
-
-        system_prompt = self._render_natural_language_polish_prompt(
-            prompt=prompt,
-            platform_name=str(platform_context["platform_name"]),
-        )
-        user_prompt = "请直接输出润色后的最终提示词。"
-        self._log_detail(
-            "info",
-            f"OpenAIImage natural language prompt polish request provider={provider.meta().id} model={provider.meta().model} "
-            f"platform={platform_context['platform_name']} original_prompt={prompt}",
-        )
-
-        try:
-            started_at = time.monotonic()
-            llm_resp = await provider.text_chat(
-                prompt=user_prompt,
-                system_prompt=system_prompt,
-            )
-            duration = time.monotonic() - started_at
-            raw_output = llm_resp.completion_text or ""
-            self._log_detail(
-                "info",
-                f"OpenAIImage natural language prompt polish response took={duration:.2f}s raw={raw_output}",
-            )
-            polished_prompt = self._sanitize_polished_prompt(raw_output)
-            if polished_prompt:
-                logger.info(
-                    f"OpenAIImage polished natural prompt original={prompt} polished={polished_prompt}"
-                )
-                return polished_prompt, self.config.get("natural_language_fallback_reply", "已开始生图任务")
-        except Exception as exc:
-            error_text = str(exc)
-            if "auth_unavailable" in error_text:
-                logger.warning(
-                    "OpenAIImage failed to polish natural prompt because the current AstrBot text provider auth is unavailable; "
-                    f"fallback to raw prompt: {error_text}"
-                )
-            else:
-                logger.warning(f"OpenAIImage failed to polish natural prompt, fallback to raw prompt: {error_text}")
-
-        return prompt, self.config.get("natural_language_fallback_reply", "已开始生图任务")
 
     @staticmethod
     def _normalize_error_message(message: str) -> str:
@@ -684,34 +560,6 @@ class OpenAIImagePlugin(Star):
                 prompt=command_prompt,
                 source="command",
                 initial_reply_text="正在生成图片，请稍等……",
-            )
-        except ValueError as exc:
-            yield event.plain_result(str(exc))
-            return
-        if initial_reply:
-            yield event.plain_result(initial_reply)
-
-    @filter.event_message_type(filter.EventMessageType.ALL)
-    async def on_natural_language_draw(self, event: AstrMessageEvent):
-        """识别高置信度的自然语言画图请求。"""
-        if not self.config.get("natural_language_enabled", True):
-            return
-
-        prompt = self._extract_natural_prompt(event.message_str or "")
-        if not prompt:
-            return
-
-        prompt, reply_text = await self._polish_natural_language_prompt(event, prompt)
-
-        if self.config.get("stop_event_after_natural_language", True):
-            event.stop_event()
-
-        try:
-            initial_reply = await self._queue_generation_task(
-                event,
-                prompt,
-                "natural_language",
-                initial_reply_text=reply_text,
             )
         except ValueError as exc:
             yield event.plain_result(str(exc))
