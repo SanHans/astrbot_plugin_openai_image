@@ -17,6 +17,7 @@ DEFAULT_MODEL = "gpt-image-2"
 COMMAND_NAMES = {"画图", "draw", "image", "绘图"}
 NATURAL_LANGUAGE_PATTERNS = (
     re.compile(r"^\s*画图[:：\s]*(?P<prompt>.+?)\s*$", re.IGNORECASE),
+    re.compile(r"^\s*(?:请|请你)?(?:帮我|给我|替我|麻烦你)\s*画(?P<prompt>.+?)\s*$", re.IGNORECASE),
     re.compile(r"^\s*(?:请|请你)?(?:帮我|给我|替我|麻烦你)?画(?:一张|个|幅|张)图?\s*(?P<prompt>.+?)\s*$", re.IGNORECASE),
     re.compile(
         r"^\s*(?:请|请你)?(?:帮我|给我|替我|麻烦你)?(?:生成|做)(?:一张|个|幅)?(?:图片|图像|图)\s*(?P<prompt>.+?)\s*$",
@@ -27,9 +28,10 @@ NATURAL_LANGUAGE_PATTERNS = (
         re.IGNORECASE,
     ),
 )
+NATURAL_LANGUAGE_EXCLUDED_PREFIXES = ("重点", "个重点", "重点画", "线", "圈", "标记")
 
 
-@register("OpenAIImage", "Codex", "使用 OpenAI 兼容接口生成图片", "1.0.0")
+@register("OpenAIImage", "Codex", "使用 OpenAI 兼容接口生成图片", "1.0.1")
 class OpenAIImagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -125,10 +127,73 @@ class OpenAIImagePlugin(Star):
                 continue
 
             prompt = self._cleanup_prompt(match.group("prompt"))
-            if prompt:
+            if prompt and not prompt.startswith(NATURAL_LANGUAGE_EXCLUDED_PREFIXES):
                 return prompt
 
         return None
+
+    @staticmethod
+    def _sanitize_polished_prompt(text: str) -> str:
+        prompt = re.sub(r"<think>[\s\S]*?</think>", "", text or "", flags=re.IGNORECASE).strip()
+        prompt = re.sub(r"^(prompt|提示词)\s*[:：]\s*", "", prompt, flags=re.IGNORECASE).strip()
+        if prompt.startswith(("```", '"""', "'''")):
+            prompt = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", prompt).strip()
+            prompt = re.sub(r"\n?```$", "", prompt).strip()
+            prompt = prompt.strip('"\'')
+        return prompt.strip().strip('"\'')
+
+    async def _polish_natural_language_prompt(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+    ) -> str:
+        provider = self.context.get_using_provider(umo=event.unified_msg_origin)
+        if not provider:
+            return prompt
+
+        try:
+            persona = await self.context.persona_manager.get_default_persona_v3(
+                event.unified_msg_origin
+            )
+            persona_prompt = str(persona.get("prompt") or "").strip()
+        except Exception as exc:
+            logger.warning(f"OpenAIImage failed to load persona, fallback to raw prompt: {exc}")
+            persona_prompt = ""
+
+        system_prompt = (
+            "你是 AstrBot 的画图提示词整理助手。"
+            "你的任务是把用户的自然语言画图请求，轻度润色成适合图像生成模型使用的一行中文提示词。"
+            "\n必须遵守以下规则："
+            "\n1. 不改变用户本意，不替换用户明确指定的主体、动作、场景、风格、情绪、时代、媒介和关系。"
+            "\n2. 只做轻度润色和少量补全，让描述更清晰可画；不要无端添加强风格、镜头语言、光照、背景、构图、画质标签。"
+            "\n3. 如果用户没有指定风格，不要强行加入“二次元、写实、电影感、赛博朋克”等具体风格。"
+            "\n4. 允许参考人格设定中的审美或措辞偏好，但人格设定不能覆盖用户需求。"
+            "\n5. 只输出最终提示词本身，不要解释，不要加引号，不要加前缀，不要分点。"
+        )
+        if persona_prompt:
+            system_prompt += f"\n当前人格设定（仅供轻度参考，不得压过用户原意）：\n{persona_prompt}"
+
+        user_prompt = (
+            "请将下面这条自然语言画图请求整理成适合图像模型的提示词。"
+            "要求保留用户原意，只做轻度润色。\n"
+            f"用户原话：{prompt}"
+        )
+
+        try:
+            llm_resp = await provider.text_chat(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+            )
+            polished = self._sanitize_polished_prompt(llm_resp.completion_text or "")
+            if polished:
+                logger.info(
+                    f"OpenAIImage polished natural prompt original={prompt} polished={polished}"
+                )
+                return polished
+        except Exception as exc:
+            logger.warning(f"OpenAIImage failed to polish natural prompt, fallback to raw prompt: {exc}")
+
+        return prompt
 
     async def _request_image_generation(self, prompt: str) -> dict[str, Any]:
         api_key = self._get_api_key()
@@ -239,6 +304,8 @@ class OpenAIImagePlugin(Star):
         if not prompt:
             return
 
+        prompt = await self._polish_natural_language_prompt(event, prompt)
+
         if self.config.get("stop_event_after_natural_language", True):
             event.stop_event()
 
@@ -250,7 +317,7 @@ class OpenAIImagePlugin(Star):
         """根据用户描述生成图片。
 
         Args:
-            prompt(string): 用于生成图片的完整描述，应该直接包含主体、风格、构图、背景、光照等要求。
+            prompt(string): 将用户的画图需求尽量原样传给生图模型。除非用户明确要求，否则不要主动添加新的风格、构图、光照、背景、画质标签或其他会改变语义侧重点的描述。
         """
         async for result in self._generate_and_reply(event, self._cleanup_prompt(prompt), "llm_tool"):
             yield result
