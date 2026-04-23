@@ -1,0 +1,122 @@
+{
+  "base_url": {
+    "type": "string",
+    "description": "OpenAI 兼容 API 地址",
+    "default": "https://api.openai.com/v1",
+    "hint": "填写兼容 OpenAI Images API 的根地址，建议精确到 /v1，例如 https://api.openai.com/v1。"
+  },
+  "api_key": {
+    "type": "string",
+    "description": "API Key",
+    "default": "",
+    "hint": "留空时会尝试读取环境变量 OPENAI_API_KEY。",
+    "obvious_hint": true
+  },
+  "model": {
+    "type": "string",
+    "description": "图像模型",
+    "default": "gpt-image-2",
+    "hint": "默认使用 OpenAI 官方的 gpt-image-2，也可以改成兼容服务上的其他图像模型名。"
+  },
+  "timeout": {
+    "type": "int",
+    "description": "请求超时时间（秒）",
+    "default": 180,
+    "min": 30,
+    "max": 600
+  },
+  "max_concurrent_tasks": {
+    "type": "int",
+    "description": "最大并发任务数",
+    "default": 3,
+    "min": 1,
+    "max": 10,
+    "hint": "限制同时发起的绘图请求数量，避免并发过高导致上游接口限流。"
+  },
+  "default_prompt_prefix": {
+    "type": "text",
+    "description": "默认提示词前缀",
+    "default": "",
+    "hint": "会自动拼接到每次绘图请求前，可用于统一风格、画风或安全限制。"
+  },
+  "size": {
+    "type": "string",
+    "description": "图片尺寸",
+    "default": "auto",
+    "hint": "支持 auto 或合法分辨率，如 1024x1024、1536x1024、1024x1536、2048x2048。"
+  },
+  "quality": {
+    "type": "string",
+    "description": "图片质量",
+    "default": "auto",
+    "options": [
+      "auto",
+      "low",
+      "medium",
+      "high"
+    ]
+  },
+  "background": {
+    "type": "string",
+    "description": "背景模式",
+    "default": "auto",
+    "options": [
+      "auto",
+      "opaque",
+      "transparent"
+    ],
+    "hint": "gpt-image-2 官方目前不支持 transparent；如果你的兼容服务支持，可自行切换。"
+  },
+  "output_format": {
+    "type": "string",
+    "description": "输出格式",
+    "default": "png",
+    "options": [
+      "png",
+      "jpeg",
+      "webp"
+    ]
+  },
+  "output_compression": {
+    "type": "int",
+    "description": "输出压缩率",
+    "default": 90,
+    "min": 0,
+    "max": 100,
+    "hint": "仅在输出格式为 jpeg 或 webp 时生效。"
+  },
+  "moderation": {
+    "type": "string",
+    "description": "内容过滤强度",
+    "default": "auto",
+    "options": [
+      "auto",
+      "low"
+    ]
+  },
+  "image_count": {
+    "type": "int",
+    "description": "单次生成图片数量",
+    "default": 1,
+    "min": 1,
+    "max": 4
+  },
+  "send_prompt_back": {
+    "type": "bool",
+    "description": "返回修订后的提示词",
+    "default": false,
+    "hint": "仅当上游接口返回 revised_prompt 时才会发送。"
+  },
+  "natural_language_enabled": {
+    "type": "bool",
+    "description": "启用自然语言触发",
+    "default": true,
+    "hint": "开启后，类似“画图 …”“帮我生成一张图片 …”“帮我画一张图 …”的消息会直接触发绘图。"
+  },
+  "stop_event_after_natural_language": {
+    "type": "bool",
+    "description": "自然语言触发后停止事件传播",
+    "default": true,
+    "hint": "建议保持开启，避免插件已开始生图后，AstrBot 又继续把同一条消息发给 LLM 导致重复回复。"
+  }
+}
