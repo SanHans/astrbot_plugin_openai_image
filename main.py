@@ -1,35 +1,40 @@
 import asyncio
 import base64
+import contextlib
 import json
+import mimetypes
 import os
 import re
 import time
 import uuid
+from collections.abc import Coroutine
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
+from pydantic import Field
+from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Image, Plain
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
+from astrbot.core.agent.run_context import ContextWrapper
+from astrbot.core.agent.tool import FunctionTool, ToolExecResult
+from astrbot.core.astr_agent_context import AstrAgentContext
 
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-image-2"
-DEFAULT_NATURAL_LANGUAGE_POLISH_PROMPT_TEMPLATE = """你是 AstrBot 画图插件的自然语言解析器。
-请根据“用户原话”和“当前人格设定”，输出一个 JSON 对象，格式严格如下：
-{"prompt":"适合图像模型的最终提示词","reply":"一条符合当前人格口吻的简短回复"}
+DEFAULT_NATURAL_LANGUAGE_POLISH_PROMPT_TEMPLATE = """你是 AstrBot 画图插件的自然语言提示词整理器。
+请根据“用户原话”，输出一个 JSON 对象，格式严格如下：
+{"prompt":"适合图像模型的最终提示词","reply":"一条简短自然的回复"}
 
 规则：
 1. prompt 必须保留用户本意，只做轻度润色和必要补全，不得擅自改变主体、动作、关系、场景、风格、时代、情绪和媒介。
 2. 如果用户没有明确指定风格，不要擅自添加二次元、写实、电影感、赛博朋克等强风格词。
 3. 不要添加大量画质、镜头、构图、光照标签，不要把简单需求扩写成堆砌关键词。
-4. reply 要符合当前人格口吻，自然、简短，表达“我来帮你画/这就画”，不要输出“正在生成图片，请稍等……”这句原话。
+4. reply 只需要一句自然、简短的中文回复，表达“我来帮你画/这就画”，不要输出“正在生成图片，请稍等……”这句原话。
 5. 只输出 JSON，不要解释，不要 Markdown，不要代码块。
-
-当前人格设定：
-{{persona_prompt}}
 
 平台类型：
 {{platform_name}}
@@ -54,21 +59,110 @@ NATURAL_LANGUAGE_PATTERNS = (
 NATURAL_LANGUAGE_EXCLUDED_PREFIXES = ("重点", "个重点", "重点画", "线", "圈", "标记")
 
 
-@register("OpenAIImage", "SanHans", "使用 OpenAI 兼容接口生成图片", "1.0.2")
+@pydantic_dataclass
+class GenerateImageTool(FunctionTool[AstrAgentContext]):
+    """根据用户描述生成图片，并在完成后推送到当前会话。"""
+
+    name: str = "generate_image"
+    description: str = "使用图像模型生成图片"
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "将用户的画图需求尽量原样传给生图模型。除非用户明确要求，否则不要主动添加新的风格、构图、光照、背景、画质标签或其他会改变语义侧重点的描述。",
+                }
+            },
+            "required": ["prompt"],
+        }
+    )
+    plugin: Any = None
+
+    async def call(
+        self,
+        context: ContextWrapper[AstrAgentContext],
+        **kwargs: Any,
+    ) -> ToolExecResult:
+        prompt = str(kwargs.get("prompt") or "").strip()
+        if not prompt:
+            return "请先给出要生成的图片描述。"
+
+        plugin = self.plugin
+        if not plugin:
+            return "图片插件未正确初始化。"
+
+        event = None
+        if hasattr(context, "context") and isinstance(context.context, AstrAgentContext):
+            event = context.context.event
+        elif isinstance(context, dict):
+            event = context.get("event")
+
+        if not event:
+            logger.warning("OpenAIImage tool call missing event context")
+            return "当前无法获取会话上下文，暂时不能直接发送图片。"
+
+        cleaned_prompt = plugin._cleanup_prompt(prompt)
+        if not cleaned_prompt:
+            return "请先给出要生成的图片描述。"
+
+        try:
+            await plugin._queue_generation_task(
+                event=event,
+                prompt=cleaned_prompt,
+                source="llm_tool",
+            )
+        except ValueError as exc:
+            return str(exc)
+        return "我会按用户的描述生成图片，并在完成后直接把结果发送到当前会话。"
+
+
+@register("OpenAIImage", "SanHans", "使用 OpenAI 兼容接口生成图片", "1.0.3")
 class OpenAIImagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
         self._session: aiohttp.ClientSession | None = None
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._tool_registered = False
         max_concurrent_tasks = int(self.config.get("max_concurrent_tasks", 3) or 3)
         self._semaphore = asyncio.Semaphore(max(1, max_concurrent_tasks))
         self._image_temp_dir = os.path.abspath("data/temp/openai_image")
         os.makedirs(self._image_temp_dir, exist_ok=True)
 
+    async def initialize(self):
+        if not self._tool_registered:
+            self.context.add_llm_tools(GenerateImageTool(plugin=self))
+            self._tool_registered = True
+
     async def terminate(self):
+        if self._background_tasks:
+            tasks = list(self._background_tasks)
+            self._background_tasks.clear()
+            for task in tasks:
+                task.cancel()
+            with contextlib.suppress(Exception):
+                await asyncio.gather(*tasks, return_exceptions=True)
         if self._session and not self._session.closed:
             await self._session.close()
         self._session = None
+
+    def _create_background_task(self, coro: Coroutine[Any, Any, None]) -> asyncio.Task[Any]:
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+
+        def _cleanup(done_task: asyncio.Task[Any]) -> None:
+            self._background_tasks.discard(done_task)
+            try:
+                exc = done_task.exception()
+            except asyncio.CancelledError:
+                self._log_detail("info", "OpenAIImage background task cancelled")
+                return
+            if exc is not None:
+                logger.error(f"OpenAIImage background task failed: {exc}")
+
+        task.add_done_callback(_cleanup)
+        return task
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         timeout = int(self.config.get("timeout", 180) or 180)
@@ -149,14 +243,14 @@ class OpenAIImagePlugin(Star):
         is_wecom_ai_bot = platform_name == "wecom_ai_bot"
         supports_image_output = True
         image_limit_reason = ""
-        allow_progress_message = True
+        allow_initial_reply = True
 
         if is_wecom_ai_bot:
-            allow_progress_message = False
+            allow_initial_reply = False
             if not has_wecom_webhook:
                 image_limit_reason = (
                     "当前企业微信智能机器人未配置消息推送 Webhook URL。"
-                    "插件会避免先发送进度消息，尽量把文本和图片合并为一次最终回复；"
+                    "插件会避免先发送中间消息，尽量把文本和图片合并为一次最终回复；"
                     "如果仍遇到图片不回传，建议在该渠道配置 `msg_push_webhook_url`，"
                     "或改用 `wecom` 企业微信应用渠道。"
                 )
@@ -169,7 +263,7 @@ class OpenAIImagePlugin(Star):
             "has_wecom_webhook": has_wecom_webhook,
             "supports_image_output": supports_image_output,
             "image_limit_reason": image_limit_reason,
-            "allow_progress_message": allow_progress_message,
+            "allow_initial_reply": allow_initial_reply,
         }
         self._log_detail("info", f"OpenAIImage platform context: {platform_context}")
         if image_limit_reason:
@@ -256,7 +350,6 @@ class OpenAIImagePlugin(Star):
     def _render_natural_language_polish_prompt(
         self,
         prompt: str,
-        persona_prompt: str,
         platform_name: str,
     ) -> str:
         template = str(
@@ -265,7 +358,6 @@ class OpenAIImagePlugin(Star):
         ).strip()
         return (
             template.replace("{{user_prompt}}", prompt)
-            .replace("{{persona_prompt}}", persona_prompt or "未配置人格设定")
             .replace("{{platform_name}}", platform_name or "unknown")
         )
 
@@ -280,24 +372,15 @@ class OpenAIImagePlugin(Star):
             self._log_detail("warning", "OpenAIImage no provider found for natural language polishing; fallback to raw prompt")
             return prompt, self.config.get("natural_language_fallback_reply", "好，我来画这个。")
 
-        try:
-            persona = await self.context.persona_manager.get_default_persona_v3(
-                event.unified_msg_origin
-            )
-            persona_prompt = str(persona.get("prompt") or "").strip()
-        except Exception as exc:
-            logger.warning(f"OpenAIImage failed to load persona, fallback to raw prompt: {exc}")
-            persona_prompt = ""
         system_prompt = self._render_natural_language_polish_prompt(
             prompt=prompt,
-            persona_prompt=persona_prompt,
             platform_name=str(platform_context["platform_name"]),
         )
         user_prompt = "请严格按照系统要求输出 JSON 结果。"
         self._log_detail(
             "info",
             f"OpenAIImage natural language polish request provider={provider.meta().id} model={provider.meta().model} "
-            f"platform={platform_context['platform_name']} original_prompt={prompt} persona_prompt={persona_prompt}",
+            f"platform={platform_context['platform_name']} original_prompt={prompt}",
         )
 
         try:
@@ -373,12 +456,42 @@ class OpenAIImagePlugin(Star):
     def _save_base64_image(self, image_base64: str) -> str:
         output_format = str(self.config.get("output_format") or "png").strip().lower()
         extension = {"jpeg": "jpg", "jpg": "jpg", "png": "png", "webp": "webp"}.get(output_format, "png")
+        return self._save_image_bytes(base64.b64decode(image_base64), extension)
+
+    def _save_image_bytes(self, image_bytes: bytes, extension: str) -> str:
+        extension = extension.strip(".").lower() or "png"
         filename = f"openai_image_{uuid.uuid4().hex}.{extension}"
         file_path = os.path.join(self._image_temp_dir, filename)
         with open(file_path, "wb") as file:
-            file.write(base64.b64decode(image_base64))
+            file.write(image_bytes)
         self._log_detail("info", f"OpenAIImage saved image to {file_path}")
         return file_path
+
+    @staticmethod
+    def _guess_extension_from_response(image_url: str, content_type: str) -> str:
+        mime = (content_type or "").split(";", 1)[0].strip().lower()
+        extension = mimetypes.guess_extension(mime) or ""
+        if not extension:
+            extension = os.path.splitext(urlparse(image_url).path)[1]
+        extension = extension.lower()
+        if extension in {".jpg", ".jpeg"}:
+            return "jpg"
+        if extension in {".png", ".webp", ".gif"}:
+            return extension.lstrip(".")
+        return "png"
+
+    async def _download_remote_image(self, image_url: str) -> str:
+        session = await self._ensure_session()
+        self._log_detail("info", f"OpenAIImage downloading remote image {image_url}")
+        async with session.get(image_url) as response:
+            if response.status >= 400:
+                raise RuntimeError(f"下载图片失败（{response.status}）：{image_url}")
+            image_bytes = await response.read()
+            extension = self._guess_extension_from_response(
+                image_url=image_url,
+                content_type=response.headers.get("Content-Type", ""),
+            )
+        return self._save_image_bytes(image_bytes, extension)
 
     def _extract_revised_prompt(self, data: dict[str, Any]) -> str | None:
         data_list = data.get("data")
@@ -387,16 +500,8 @@ class OpenAIImagePlugin(Star):
             return revised_prompt or None
         return None
 
-    def _build_image_chain(
-        self,
-        data: dict[str, Any],
-        preamble_texts: list[str] | None = None,
-    ) -> list[Any]:
-        chain: list[Any] = []
-        for text in preamble_texts or []:
-            if text:
-                chain.append(Plain(text))
-
+    async def _collect_image_files(self, data: dict[str, Any]) -> list[str]:
+        image_files: list[str] = []
         images = data.get("data", [])
         if not isinstance(images, list):
             raise RuntimeError("接口返回格式异常：缺少 data 数组。")
@@ -409,78 +514,163 @@ class OpenAIImagePlugin(Star):
             image_url = item.get("url")
 
             if isinstance(b64_json, str) and b64_json.strip():
-                file_path = self._save_base64_image(b64_json.strip())
-                chain.append(Image.fromFileSystem(file_path))
+                image_files.append(self._save_base64_image(b64_json.strip()))
                 continue
 
             if isinstance(image_url, str) and image_url.strip():
-                self._log_detail("info", f"OpenAIImage using remote image URL {image_url.strip()}")
-                chain.append(Image.fromURL(image_url.strip()))
+                image_files.append(await self._download_remote_image(image_url.strip()))
 
-        if not any(isinstance(component, Image) for component in chain):
+        if not image_files:
             raise RuntimeError("接口未返回可发送的图片数据。")
+        self._log_detail("info", f"OpenAIImage prepared {len(image_files)} image file(s) for sending")
+        return image_files
 
+    def _build_message_chain(
+        self,
+        image_files: list[str],
+        preamble_texts: list[str] | None = None,
+    ) -> MessageChain:
+        chain = MessageChain()
+        for text in preamble_texts or []:
+            if text:
+                chain.message(text)
+        for file_path in image_files:
+            chain.file_image(file_path)
         return chain
 
-    async def _generate_and_reply(
+    async def _send_message_chain(
         self,
-        event: AstrMessageEvent,
+        unified_msg_origin: str,
+        chain: MessageChain,
+        source: str,
+        stage: str,
+        text_count: int,
+        image_count: int,
+    ) -> None:
+        self._log_detail(
+            "info",
+            f"OpenAIImage sending active message source={source} stage={stage} "
+            f"umo={unified_msg_origin} texts={text_count} images={image_count}",
+        )
+        await self.context.send_message(unified_msg_origin, chain)
+        self._log_detail(
+            "info",
+            f"OpenAIImage active message sent source={source} stage={stage} "
+            f"umo={unified_msg_origin} texts={text_count} images={image_count}",
+        )
+
+    async def _send_error_message(self, unified_msg_origin: str, text: str, source: str) -> None:
+        chain = MessageChain().message(text)
+        await self._send_message_chain(
+            unified_msg_origin=unified_msg_origin,
+            chain=chain,
+            source=source,
+            stage="error",
+            text_count=1,
+            image_count=0,
+        )
+
+    async def _run_generation_task(
+        self,
+        unified_msg_origin: str,
         prompt: str,
         source: str,
-        natural_language_reply: str | None = None,
-        send_progress_message: bool | None = None,
-    ):
-        final_prompt = self._compose_prompt(prompt)
-        if not final_prompt:
-            yield event.plain_result("请输入要绘制的内容，例如：/画图 一只戴墨镜的赛博朋克橘猫")
-            return
-
-        platform_context = self._get_platform_context(event)
-        if send_progress_message is None:
-            send_progress_message = bool(platform_context["allow_progress_message"] and source != "natural_language")
-
+        platform_context: dict[str, Any],
+        final_preamble_texts: list[str] | None = None,
+    ) -> None:
         async with self._semaphore:
             try:
                 logger.info(
                     f"OpenAIImage request source={source} platform={platform_context['platform_name']} "
-                    f"platform_id={platform_context['platform_id']} prompt={final_prompt}"
+                    f"platform_id={platform_context['platform_id']} prompt={prompt}"
                 )
-                if send_progress_message:
-                    yield event.plain_result("正在生成图片，请稍等……")
-
-                response = await self._request_image_generation(final_prompt)
+                response = await self._request_image_generation(prompt)
                 revised_prompt = self._extract_revised_prompt(response)
-                preamble_texts: list[str] = []
-                if natural_language_reply:
-                    preamble_texts.append(natural_language_reply)
+                preamble_texts = list(final_preamble_texts or [])
                 if self.config.get("send_prompt_back", False) and revised_prompt:
                     preamble_texts.append(f"最终提示词：{revised_prompt}")
-
-                chain = self._build_image_chain(response, preamble_texts=preamble_texts)
-                self._log_detail(
-                    "info",
-                    f"OpenAIImage built final message chain components={[type(component).__name__ for component in chain]}",
+                image_files = await self._collect_image_files(response)
+                chain = self._build_message_chain(image_files, preamble_texts=preamble_texts)
+                await self._send_message_chain(
+                    unified_msg_origin=unified_msg_origin,
+                    chain=chain,
+                    source=source,
+                    stage="final",
+                    text_count=len([text for text in preamble_texts if text]),
+                    image_count=len(image_files),
                 )
-                yield event.chain_result(chain)
             except ValueError as exc:
                 logger.warning(f"OpenAIImage invalid config: {exc}")
-                yield event.plain_result(f"配置错误：{exc}")
+                await self._send_error_message(unified_msg_origin, f"配置错误：{exc}", source)
             except aiohttp.ClientError as exc:
                 logger.error(f"OpenAIImage network error: {exc}")
-                yield event.plain_result(f"网络请求失败：{exc}")
+                await self._send_error_message(unified_msg_origin, f"网络请求失败：{exc}", source)
             except asyncio.TimeoutError:
                 logger.error("OpenAIImage request timed out")
-                yield event.plain_result("请求超时，请稍后重试，或适当调低图片质量/尺寸。")
+                await self._send_error_message(
+                    unified_msg_origin,
+                    "请求超时，请稍后重试，或适当调低图片质量/尺寸。",
+                    source,
+                )
             except Exception as exc:
                 logger.exception(f"OpenAIImage generation failed: {exc}")
-                yield event.plain_result(f"生成失败：{exc}")
+                await self._send_error_message(unified_msg_origin, f"生成失败：{exc}", source)
+
+    async def _queue_generation_task(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        source: str,
+        initial_reply_text: str | None = None,
+        final_preamble_texts: list[str] | None = None,
+    ) -> str | None:
+        final_prompt = self._compose_prompt(prompt)
+        if not final_prompt:
+            raise ValueError("请输入要绘制的内容，例如：/画图 一只戴墨镜的赛博朋克橘猫")
+
+        platform_context = self._get_platform_context(event)
+        send_initial_reply = bool(initial_reply_text and platform_context["allow_initial_reply"])
+        effective_final_preamble_texts = list(final_preamble_texts or [])
+        if initial_reply_text and not send_initial_reply:
+            effective_final_preamble_texts.insert(0, initial_reply_text)
+
+        self._log_detail(
+            "info",
+            f"OpenAIImage queue generation source={source} platform={platform_context['platform_name']} "
+            f"send_initial_reply={send_initial_reply} final_preamble_count={len(effective_final_preamble_texts)} "
+            f"prompt={final_prompt}",
+        )
+        self._create_background_task(
+            self._run_generation_task(
+                unified_msg_origin=event.unified_msg_origin,
+                prompt=final_prompt,
+                source=source,
+                platform_context=platform_context,
+                final_preamble_texts=effective_final_preamble_texts,
+            )
+        )
+        return initial_reply_text if send_initial_reply else None
 
     @filter.command("画图", alias={"draw", "image", "绘图"})
     async def draw_image(self, event: AstrMessageEvent, prompt: str = ""):
         """使用 OpenAI 图像模型生成图片。"""
         command_prompt = self._extract_command_prompt(event, prompt)
-        async for result in self._generate_and_reply(event, command_prompt, "command"):
-            yield result
+        if not command_prompt:
+            yield event.plain_result("请输入要绘制的内容，例如：/画图 一只戴墨镜的赛博朋克橘猫")
+            return
+
+        try:
+            initial_reply = await self._queue_generation_task(
+                event=event,
+                prompt=command_prompt,
+                source="command",
+                initial_reply_text="正在生成图片，请稍等……",
+            )
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
+        if initial_reply:
+            yield event.plain_result(initial_reply)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_natural_language_draw(self, event: AstrMessageEvent):
@@ -497,21 +687,15 @@ class OpenAIImagePlugin(Star):
         if self.config.get("stop_event_after_natural_language", True):
             event.stop_event()
 
-        async for result in self._generate_and_reply(
-            event,
-            prompt,
-            "natural_language",
-            natural_language_reply=reply_text,
-            send_progress_message=False,
-        ):
-            yield result
-
-    @filter.llm_tool(name="generate_image")
-    async def generate_image_tool(self, event: AstrMessageEvent, prompt: str):
-        """根据用户描述生成图片。
-
-        Args:
-            prompt(string): 将用户的画图需求尽量原样传给生图模型。除非用户明确要求，否则不要主动添加新的风格、构图、光照、背景、画质标签或其他会改变语义侧重点的描述。
-        """
-        async for result in self._generate_and_reply(event, self._cleanup_prompt(prompt), "llm_tool"):
-            yield result
+        try:
+            initial_reply = await self._queue_generation_task(
+                event,
+                prompt,
+                "natural_language",
+                initial_reply_text=reply_text,
+            )
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
+        if initial_reply:
+            yield event.plain_result(initial_reply)
