@@ -86,7 +86,7 @@ class GenerateImageTool(FunctionTool[AstrAgentContext]):
         return "图像生成任务已启动，结果会在完成后自动发送到当前会话。"
 
 
-@register("OpenAIImage", "SanHans", "使用 OpenAI 兼容接口生成图片", "1.0.7")
+@register("OpenAIImage", "SanHans", "使用 OpenAI 兼容接口生成图片", "1.0.8")
 class OpenAIImagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -134,10 +134,48 @@ class OpenAIImagePlugin(Star):
         return task
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
-        timeout = int(self.config.get("timeout", 180) or 180)
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout))
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
         return self._session
+
+    def _get_legacy_timeout(self) -> int:
+        return max(5, int(self.config.get("timeout", 180) or 180))
+
+    def _get_generation_timeout(self) -> int:
+        value = self.config.get("generation_timeout", self._get_legacy_timeout())
+        return max(5, int(value or self._get_legacy_timeout()))
+
+    def _get_download_timeout(self) -> int:
+        fallback = min(self._get_generation_timeout(), 60)
+        value = self.config.get("download_timeout", fallback)
+        return max(5, int(value or fallback))
+
+    def _get_retry_count(self) -> int:
+        return max(0, min(int(self.config.get("retry_count", 1) or 1), 5))
+
+    def _get_retry_backoff_seconds(self) -> float:
+        return max(0.0, float(int(self.config.get("retry_backoff_seconds", 2) or 2)))
+
+    def _get_proxy_url(self) -> str:
+        return str(self.config.get("proxy_url") or "").strip()
+
+    @staticmethod
+    def _should_retry_status(status_code: int) -> bool:
+        return status_code in {408, 429, 500, 502, 503, 504}
+
+    def _build_request_kwargs(self, timeout_seconds: int) -> dict[str, Any]:
+        request_kwargs: dict[str, Any] = {
+            "timeout": aiohttp.ClientTimeout(total=max(5, int(timeout_seconds))),
+        }
+        proxy_url = self._get_proxy_url()
+        if proxy_url:
+            request_kwargs["proxy"] = proxy_url
+        return request_kwargs
+
+    async def _sleep_before_retry(self, attempt: int) -> None:
+        delay = self._get_retry_backoff_seconds() * max(1, attempt)
+        if delay > 0:
+            await asyncio.sleep(delay)
 
     def _get_api_key(self) -> str:
         return str(self.config.get("api_key") or os.getenv("OPENAI_API_KEY") or "").strip()
@@ -303,38 +341,69 @@ class OpenAIImagePlugin(Star):
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
+        generation_timeout = self._get_generation_timeout()
+        retry_count = self._get_retry_count()
+        total_attempts = retry_count + 1
+        proxy_url = self._get_proxy_url()
         self._log_detail(
             "info",
             f"OpenAIImage request endpoint={endpoint} model={payload.get('model')} size={payload.get('size')} "
             f"quality={payload.get('quality')} n={payload.get('n')} moderation={payload.get('moderation')} "
-            f"prompt={prompt}",
+            f"timeout={generation_timeout}s retries={retry_count} proxy={proxy_url or 'none'} prompt={prompt}",
         )
 
-        started_at = time.monotonic()
-        async with session.post(endpoint, headers=headers, json=payload) as response:
-            text = await response.text()
-            data: dict[str, Any]
+        for attempt in range(1, total_attempts + 1):
+            started_at = time.monotonic()
             try:
-                data = json.loads(text)
-            except json.JSONDecodeError:
-                data = {"raw_text": text}
-            duration = time.monotonic() - started_at
-            data_count = len(data.get("data", [])) if isinstance(data.get("data"), list) else 0
-            self._log_detail(
-                "info",
-                f"OpenAIImage response status={response.status} took={duration:.2f}s data_count={data_count} "
-                f"keys={list(data.keys()) if isinstance(data, dict) else type(data)}",
-            )
+                async with session.post(
+                    endpoint,
+                    headers=headers,
+                    json=payload,
+                    **self._build_request_kwargs(generation_timeout),
+                ) as response:
+                    text = await response.text()
+                    data: dict[str, Any]
+                    try:
+                        data = json.loads(text)
+                    except json.JSONDecodeError:
+                        data = {"raw_text": text}
+                    duration = time.monotonic() - started_at
+                    data_count = len(data.get("data", [])) if isinstance(data.get("data"), list) else 0
+                    self._log_detail(
+                        "info",
+                        f"OpenAIImage response status={response.status} took={duration:.2f}s "
+                        f"attempt={attempt}/{total_attempts} data_count={data_count} "
+                        f"keys={list(data.keys()) if isinstance(data, dict) else type(data)}",
+                    )
 
-            if response.status >= 400:
-                error_message = (
-                    data.get("error", {}).get("message")
-                    if isinstance(data.get("error"), dict)
-                    else data.get("error")
-                ) or data.get("message") or text
-                raise RuntimeError(f"请求失败（{response.status}）：{error_message}")
+                    if response.status >= 400:
+                        error_message = (
+                            data.get("error", {}).get("message")
+                            if isinstance(data.get("error"), dict)
+                            else data.get("error")
+                        ) or data.get("message") or text
+                        if attempt < total_attempts and self._should_retry_status(response.status):
+                            logger.warning(
+                                f"OpenAIImage generation request failed with retryable status={response.status} "
+                                f"attempt={attempt}/{total_attempts} retrying: {self._normalize_error_message(error_message)}"
+                            )
+                            await self._sleep_before_retry(attempt)
+                            continue
+                        raise RuntimeError(f"请求失败（{response.status}）：{error_message}")
 
-            return data
+                    return data
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                duration = time.monotonic() - started_at
+                if attempt < total_attempts:
+                    logger.warning(
+                        f"OpenAIImage generation request exception attempt={attempt}/{total_attempts} "
+                        f"took={duration:.2f}s retrying: {exc}"
+                    )
+                    await self._sleep_before_retry(attempt)
+                    continue
+                raise
+
+        raise RuntimeError("请求失败：超过最大重试次数")
 
     def _save_base64_image(self, image_base64: str) -> str:
         output_format = str(self.config.get("output_format") or "png").strip().lower()
@@ -365,16 +434,55 @@ class OpenAIImagePlugin(Star):
 
     async def _download_remote_image(self, image_url: str) -> str:
         session = await self._ensure_session()
-        self._log_detail("info", f"OpenAIImage downloading remote image {image_url}")
-        async with session.get(image_url) as response:
-            if response.status >= 400:
-                raise RuntimeError(f"下载图片失败（{response.status}）：{image_url}")
-            image_bytes = await response.read()
-            extension = self._guess_extension_from_response(
-                image_url=image_url,
-                content_type=response.headers.get("Content-Type", ""),
-            )
-        return self._save_image_bytes(image_bytes, extension)
+        download_timeout = self._get_download_timeout()
+        retry_count = self._get_retry_count()
+        total_attempts = retry_count + 1
+        proxy_url = self._get_proxy_url()
+        self._log_detail(
+            "info",
+            f"OpenAIImage downloading remote image url={image_url} timeout={download_timeout}s "
+            f"retries={retry_count} proxy={proxy_url or 'none'}",
+        )
+        for attempt in range(1, total_attempts + 1):
+            started_at = time.monotonic()
+            try:
+                async with session.get(
+                    image_url,
+                    **self._build_request_kwargs(download_timeout),
+                ) as response:
+                    if response.status >= 400:
+                        if attempt < total_attempts and self._should_retry_status(response.status):
+                            logger.warning(
+                                f"OpenAIImage remote image download failed with retryable status={response.status} "
+                                f"attempt={attempt}/{total_attempts} retrying url={image_url}"
+                            )
+                            await self._sleep_before_retry(attempt)
+                            continue
+                        raise RuntimeError(f"下载图片失败（{response.status}）：{image_url}")
+                    image_bytes = await response.read()
+                    extension = self._guess_extension_from_response(
+                        image_url=image_url,
+                        content_type=response.headers.get("Content-Type", ""),
+                    )
+                    duration = time.monotonic() - started_at
+                    self._log_detail(
+                        "info",
+                        f"OpenAIImage downloaded remote image url={image_url} took={duration:.2f}s "
+                        f"attempt={attempt}/{total_attempts} bytes={len(image_bytes)}",
+                    )
+                    return self._save_image_bytes(image_bytes, extension)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                duration = time.monotonic() - started_at
+                if attempt < total_attempts:
+                    logger.warning(
+                        f"OpenAIImage remote image download exception attempt={attempt}/{total_attempts} "
+                        f"took={duration:.2f}s retrying url={image_url}: {exc}"
+                    )
+                    await self._sleep_before_retry(attempt)
+                    continue
+                raise
+
+        raise RuntimeError(f"下载图片失败：超过最大重试次数：{image_url}")
 
     def _extract_revised_prompt(self, data: dict[str, Any]) -> str | None:
         data_list = data.get("data")

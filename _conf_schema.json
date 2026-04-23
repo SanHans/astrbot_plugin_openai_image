@@ -20,10 +20,49 @@
   },
   "timeout": {
     "type": "int",
-    "description": "请求超时时间（秒）",
+    "description": "统一超时兜底（秒）",
     "default": 180,
     "min": 30,
-    "max": 600
+    "max": 600,
+    "hint": "兼容旧配置。若未单独配置 generation_timeout / download_timeout，则分别回退到这里或其衍生值。"
+  },
+  "generation_timeout": {
+    "type": "int",
+    "description": "生图请求超时时间（秒）",
+    "default": 180,
+    "min": 30,
+    "max": 600,
+    "hint": "控制调用 images/generations 接口的总超时时间。"
+  },
+  "download_timeout": {
+    "type": "int",
+    "description": "图片下载超时时间（秒）",
+    "default": 60,
+    "min": 5,
+    "max": 300,
+    "hint": "当上游返回图片 URL 而不是 base64 时，控制下载图片文件的总超时时间。"
+  },
+  "retry_count": {
+    "type": "int",
+    "description": "失败重试次数",
+    "default": 1,
+    "min": 0,
+    "max": 5,
+    "hint": "对 408/429/500/502/503/504、网络异常和本地超时进行重试。值为 1 表示失败后额外再试 1 次。"
+  },
+  "retry_backoff_seconds": {
+    "type": "int",
+    "description": "重试退避秒数",
+    "default": 2,
+    "min": 0,
+    "max": 30,
+    "hint": "每次重试前按 attempt × retry_backoff_seconds 等待，例如默认依次等待 2 秒、4 秒。"
+  },
+  "proxy_url": {
+    "type": "string",
+    "description": "代理地址",
+    "default": "",
+    "hint": "可选。填写 HTTP/HTTPS 代理地址，例如 http://127.0.0.1:7890 。会同时用于生图请求和远程图片下载。"
   },
   "max_concurrent_tasks": {
     "type": "int",
