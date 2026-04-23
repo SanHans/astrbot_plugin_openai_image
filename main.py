@@ -26,15 +26,13 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-image-2"
 DEFAULT_NATURAL_LANGUAGE_POLISH_PROMPT_TEMPLATE = """你是 AstrBot 画图插件的自然语言提示词整理器。
-请根据“用户原话”，输出一个 JSON 对象，格式严格如下：
-{"prompt":"适合图像模型的最终提示词","reply":"一条简短自然的回复"}
+请把“用户原话”整理成适合图像生成模型直接使用的最终提示词。
 
 规则：
 1. prompt 必须保留用户本意，只做轻度润色和必要补全，不得擅自改变主体、动作、关系、场景、风格、时代、情绪和媒介。
 2. 如果用户没有明确指定风格，不要擅自添加二次元、写实、电影感、赛博朋克等强风格词。
 3. 不要添加大量画质、镜头、构图、光照标签，不要把简单需求扩写成堆砌关键词。
-4. reply 只需要一句自然、简短的中文回复，表达“我来帮你画/这就画”，不要输出“正在生成图片，请稍等……”这句原话。
-5. 只输出 JSON，不要解释，不要 Markdown，不要代码块。
+4. 输出必须只有最终提示词本身，不要解释，不要 JSON，不要 Markdown，不要代码块，不要额外客套话。
 
 平台类型：
 {{platform_name}}
@@ -117,7 +115,7 @@ class GenerateImageTool(FunctionTool[AstrAgentContext]):
         return "我会按用户的描述生成图片，并在完成后直接把结果发送到当前会话。"
 
 
-@register("OpenAIImage", "SanHans", "使用 OpenAI 兼容接口生成图片", "1.0.3")
+@register("OpenAIImage", "SanHans", "使用 OpenAI 兼容接口生成图片", "1.0.5")
 class OpenAIImagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -317,36 +315,6 @@ class OpenAIImagePlugin(Star):
             prompt = prompt.strip('"\'')
         return prompt.strip().strip('"\'')
 
-    @staticmethod
-    def _sanitize_json_response(text: str) -> str:
-        content = re.sub(r"<think>[\s\S]*?</think>", "", text or "", flags=re.IGNORECASE).strip()
-        code_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", content, flags=re.IGNORECASE)
-        if code_match:
-            content = code_match.group(1).strip()
-        start = content.find("{")
-        end = content.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            content = content[start : end + 1]
-        return content.strip()
-
-    def _parse_polish_payload(self, text: str) -> tuple[str | None, str | None]:
-        cleaned = self._sanitize_json_response(text)
-        if not cleaned:
-            return None, None
-
-        try:
-            data = json.loads(cleaned)
-        except json.JSONDecodeError as exc:
-            self._log_detail("warning", f"OpenAIImage failed to parse natural language JSON: {exc}; raw={text}")
-            return None, None
-
-        if not isinstance(data, dict):
-            return None, None
-
-        prompt = self._cleanup_prompt(str(data.get("prompt") or data.get("final_prompt") or ""))
-        reply = self._cleanup_prompt(str(data.get("reply") or data.get("message") or ""))
-        return (prompt or None), (reply or None)
-
     def _render_natural_language_polish_prompt(
         self,
         prompt: str,
@@ -376,10 +344,10 @@ class OpenAIImagePlugin(Star):
             prompt=prompt,
             platform_name=str(platform_context["platform_name"]),
         )
-        user_prompt = "请严格按照系统要求输出 JSON 结果。"
+        user_prompt = "请直接输出润色后的最终提示词。"
         self._log_detail(
             "info",
-            f"OpenAIImage natural language polish request provider={provider.meta().id} model={provider.meta().model} "
+            f"OpenAIImage natural language prompt polish request provider={provider.meta().id} model={provider.meta().model} "
             f"platform={platform_context['platform_name']} original_prompt={prompt}",
         )
 
@@ -393,18 +361,57 @@ class OpenAIImagePlugin(Star):
             raw_output = llm_resp.completion_text or ""
             self._log_detail(
                 "info",
-                f"OpenAIImage natural language polish response took={duration:.2f}s raw={raw_output}",
+                f"OpenAIImage natural language prompt polish response took={duration:.2f}s raw={raw_output}",
             )
-            polished_prompt, reply_text = self._parse_polish_payload(raw_output)
+            polished_prompt = self._sanitize_polished_prompt(raw_output)
             if polished_prompt:
                 logger.info(
-                    f"OpenAIImage polished natural prompt original={prompt} polished={polished_prompt} reply={reply_text}"
+                    f"OpenAIImage polished natural prompt original={prompt} polished={polished_prompt}"
                 )
-                return polished_prompt, reply_text or self.config.get("natural_language_fallback_reply", "好，我来画这个。")
+                return polished_prompt, self.config.get("natural_language_fallback_reply", "已开始生图任务")
         except Exception as exc:
-            logger.warning(f"OpenAIImage failed to polish natural prompt, fallback to raw prompt: {exc}")
+            error_text = str(exc)
+            if "auth_unavailable" in error_text:
+                logger.warning(
+                    "OpenAIImage failed to polish natural prompt because the current AstrBot text provider auth is unavailable; "
+                    f"fallback to raw prompt: {error_text}"
+                )
+            else:
+                logger.warning(f"OpenAIImage failed to polish natural prompt, fallback to raw prompt: {error_text}")
 
-        return prompt, self.config.get("natural_language_fallback_reply", "好，我来画这个。")
+        return prompt, self.config.get("natural_language_fallback_reply", "已开始生图任务")
+
+    @staticmethod
+    def _normalize_error_message(message: str) -> str:
+        text = str(message or "").strip()
+        if not text:
+            return "未知错误"
+
+        if "<html" in text.lower():
+            if "504" in text:
+                return "上游图像接口超时（504 Gateway Time-out）"
+            if "502" in text:
+                return "上游图像接口网关错误（502 Bad Gateway）"
+            if "503" in text:
+                return "上游图像接口暂时不可用（503 Service Unavailable）"
+            title_match = re.search(r"<title>(.*?)</title>", text, flags=re.IGNORECASE | re.DOTALL)
+            if title_match:
+                return re.sub(r"\s+", " ", title_match.group(1)).strip()
+            return "上游图像接口返回了 HTML 错误页"
+
+        status_match = re.search(r"请求失败（(\d+)）[:：]?\s*(.*)", text, flags=re.DOTALL)
+        if status_match:
+            status_code = status_match.group(1)
+            detail = status_match.group(2).strip()
+            if status_code == "504":
+                return "上游图像接口超时（504）"
+            if status_code == "503":
+                return f"上游图像接口暂时不可用（503）{f'：{detail}' if detail else ''}"
+            if status_code == "502":
+                return "上游图像接口网关错误（502）"
+            return f"请求失败（{status_code}）{f'：{detail}' if detail else ''}"
+
+        return re.sub(r"\s+", " ", text)
 
     async def _request_image_generation(self, prompt: str) -> dict[str, Any]:
         api_key = self._get_api_key()
@@ -601,20 +608,32 @@ class OpenAIImagePlugin(Star):
                 )
             except ValueError as exc:
                 logger.warning(f"OpenAIImage invalid config: {exc}")
-                await self._send_error_message(unified_msg_origin, f"配置错误：{exc}", source)
+                await self._send_error_message(
+                    unified_msg_origin,
+                    f"❌ 生成失败: {self._normalize_error_message(exc)}",
+                    source,
+                )
             except aiohttp.ClientError as exc:
                 logger.error(f"OpenAIImage network error: {exc}")
-                await self._send_error_message(unified_msg_origin, f"网络请求失败：{exc}", source)
+                await self._send_error_message(
+                    unified_msg_origin,
+                    f"❌ 生成失败: 网络请求失败：{self._normalize_error_message(exc)}",
+                    source,
+                )
             except asyncio.TimeoutError:
                 logger.error("OpenAIImage request timed out")
                 await self._send_error_message(
                     unified_msg_origin,
-                    "请求超时，请稍后重试，或适当调低图片质量/尺寸。",
+                    "❌ 生成失败: 请求超时，请稍后重试。",
                     source,
                 )
             except Exception as exc:
                 logger.exception(f"OpenAIImage generation failed: {exc}")
-                await self._send_error_message(unified_msg_origin, f"生成失败：{exc}", source)
+                await self._send_error_message(
+                    unified_msg_origin,
+                    f"❌ 生成失败: {self._normalize_error_message(exc)}",
+                    source,
+                )
 
     async def _queue_generation_task(
         self,

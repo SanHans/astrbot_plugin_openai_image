@@ -2,6 +2,6 @@ name: astrbot_plugin_openai_image
 display_name: OpenAI 画图
 desc: 使用 OpenAI 兼容 images/generations 接口生成图片，支持 /画图、自然语言触发和 LLM Tool。
 help: 使用 /画图 提示词，或直接发送“画图 … / 帮我生成一张图片 … / 帮我画一张图 …”。
-version: v1.0.3
+version: v1.0.5
 author: SanHans
 repo: https://github.com/SanHans/astrbot_plugin_openai_image
