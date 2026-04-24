@@ -78,6 +78,18 @@
     "default": "",
     "hint": "会自动拼接到每次绘图请求前，可用于统一风格、画风或安全限制。"
   },
+  "natural_language_polish_enabled": {
+    "type": "bool",
+    "description": "启用自然语言提示词润色",
+    "default": false,
+    "hint": "仅在 AstrBot Agent 调用 generate_image / edit_image 工具时生效。开启后，会先用当前会话的文本模型按下方模板轻度润色提示词，再发起图像请求。"
+  },
+  "natural_language_polish_prompt_template": {
+    "type": "text",
+    "description": "自然语言润色模板",
+    "default": "你是 AstrBot 画图插件的自然语言提示词整理器。\n请把“用户原话”整理成适合图像生成模型直接使用的最终提示词。\n\n规则：\n1. 必须保留用户本意，只做轻度润色和必要补全，不得擅自改变主体、动作、关系、场景、风格、时代、情绪和媒介。\n2. 如果用户没有明确指定风格，不要擅自添加二次元、写实、电影感、赛博朋克等强风格词。\n3. 不要添加大量画质、镜头、构图、光照标签，不要把简单需求扩写成堆砌关键词。\n4. 输出必须只有最终提示词本身，不要解释，不要 JSON，不要 Markdown，不要代码块，不要额外客套话。\n\n平台类型：\n{{platform_name}}\n\n用户原话：\n{{user_prompt}}\n",
+    "hint": "仅在开启自然语言提示词润色后生效。支持变量 {{user_prompt}}、{{platform_name}}。"
+  },
   "detailed_logging": {
     "type": "bool",
     "description": "启用详细日志",

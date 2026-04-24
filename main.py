@@ -26,6 +26,21 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-image-2"
+DEFAULT_NATURAL_LANGUAGE_POLISH_PROMPT_TEMPLATE = """你是 AstrBot 画图插件的自然语言提示词整理器。
+请把“用户原话”整理成适合图像生成模型直接使用的最终提示词。
+
+规则：
+1. 必须保留用户本意，只做轻度润色和必要补全，不得擅自改变主体、动作、关系、场景、风格、时代、情绪和媒介。
+2. 如果用户没有明确指定风格，不要擅自添加二次元、写实、电影感、赛博朋克等强风格词。
+3. 不要添加大量画质、镜头、构图、光照标签，不要把简单需求扩写成堆砌关键词。
+4. 输出必须只有最终提示词本身，不要解释，不要 JSON，不要 Markdown，不要代码块，不要额外客套话。
+
+平台类型：
+{{platform_name}}
+
+用户原话：
+{{user_prompt}}
+"""
 COMMAND_NAMES = {"画图", "draw", "image", "绘图"}
 IMAGE_EDIT_COMMAND_NAMES = {"图生图", "img2img", "image2image"}
 RETOUCH_COMMAND_NAMES = {"修图", "改图", "edit", "inpaint"}
@@ -78,6 +93,12 @@ class GenerateImageTool(FunctionTool[AstrAgentContext]):
         cleaned_prompt = plugin._cleanup_prompt(prompt)
         if not cleaned_prompt:
             return "请先给出要生成的图片描述。"
+
+        cleaned_prompt = await plugin._maybe_polish_tool_prompt(
+            event=event,
+            prompt=cleaned_prompt,
+            source="llm_tool",
+        )
 
         try:
             await plugin._queue_generation_task(
@@ -137,6 +158,12 @@ class EditImageTool(FunctionTool[AstrAgentContext]):
         if not cleaned_prompt:
             return "请先说明你想怎么修改这张图片。"
 
+        cleaned_prompt = await plugin._maybe_polish_tool_prompt(
+            event=event,
+            prompt=cleaned_prompt,
+            source="llm_tool_edit",
+        )
+
         try:
             await plugin._queue_edit_task(
                 event=event,
@@ -148,7 +175,7 @@ class EditImageTool(FunctionTool[AstrAgentContext]):
         return "图像编辑任务已启动，结果会在完成后自动发送到当前会话。"
 
 
-@register("OpenAIImage", "SanHans", "使用 OpenAI 兼容接口生成图片", "1.1.0")
+@register("OpenAIImage", "SanHans", "使用 OpenAI 兼容接口生成图片", "1.1.1")
 class OpenAIImagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -220,6 +247,9 @@ class OpenAIImagePlugin(Star):
 
     def _get_proxy_url(self) -> str:
         return str(self.config.get("proxy_url") or "").strip()
+
+    def _is_natural_language_polish_enabled(self) -> bool:
+        return bool(self.config.get("natural_language_polish_enabled", False))
 
     @staticmethod
     def _should_retry_status(status_code: int) -> bool:
@@ -460,6 +490,99 @@ class OpenAIImagePlugin(Star):
         if isinstance(data, dict):
             return data
         return {"raw_data": data}
+
+    @staticmethod
+    def _sanitize_polished_prompt(text: str) -> str:
+        prompt = re.sub(r"<think>[\s\S]*?</think>", "", text or "", flags=re.IGNORECASE).strip()
+        prompt = re.sub(r"^(prompt|提示词)\s*[:：]\s*", "", prompt, flags=re.IGNORECASE).strip()
+        if prompt.startswith(("```", '"""', "'''")):
+            prompt = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", prompt).strip()
+            prompt = re.sub(r"\n?```$", "", prompt).strip()
+            prompt = prompt.strip('"\'')
+        return prompt.strip().strip('"\'')
+
+    def _render_natural_language_polish_prompt(
+        self,
+        prompt: str,
+        platform_name: str,
+    ) -> str:
+        template = str(
+            self.config.get("natural_language_polish_prompt_template")
+            or DEFAULT_NATURAL_LANGUAGE_POLISH_PROMPT_TEMPLATE
+        ).strip()
+        return (
+            template.replace("{{user_prompt}}", prompt)
+            .replace("{{platform_name}}", platform_name or "unknown")
+        )
+
+    async def _maybe_polish_tool_prompt(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        source: str,
+    ) -> str:
+        cleaned_prompt = self._cleanup_prompt(prompt)
+        if not cleaned_prompt or not self._is_natural_language_polish_enabled():
+            return cleaned_prompt
+
+        platform_context = self._get_platform_context(event)
+        provider = self.context.get_using_provider(umo=event.unified_msg_origin)
+        if not provider:
+            self._log_detail(
+                "warning",
+                f"OpenAIImage natural language polish skipped source={source}: no provider found; fallback to raw prompt",
+            )
+            return cleaned_prompt
+
+        system_prompt = self._render_natural_language_polish_prompt(
+            prompt=cleaned_prompt,
+            platform_name=str(platform_context["platform_name"]),
+        )
+        user_prompt = "请直接输出润色后的最终提示词。"
+
+        try:
+            meta = provider.meta()
+            provider_id = getattr(meta, "id", "unknown")
+            provider_model = getattr(meta, "model", "unknown")
+        except Exception:
+            provider_id = "unknown"
+            provider_model = "unknown"
+
+        self._log_detail(
+            "info",
+            f"OpenAIImage natural language polish request source={source} provider={provider_id} "
+            f"model={provider_model} platform={platform_context['platform_name']} original_prompt={cleaned_prompt}",
+        )
+
+        try:
+            started_at = time.monotonic()
+            llm_resp = await provider.text_chat(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+            )
+            duration = time.monotonic() - started_at
+            raw_output = llm_resp.completion_text or ""
+            self._log_detail(
+                "info",
+                f"OpenAIImage natural language polish response source={source} took={duration:.2f}s raw={raw_output}",
+            )
+            polished_prompt = self._sanitize_polished_prompt(raw_output)
+            if polished_prompt:
+                logger.info(
+                    f"OpenAIImage polished natural prompt source={source} original={cleaned_prompt} polished={polished_prompt}"
+                )
+                return polished_prompt
+        except Exception as exc:
+            error_text = str(exc)
+            if "auth_unavailable" in error_text:
+                logger.warning(
+                    "OpenAIImage failed to polish natural prompt because the current AstrBot text provider auth is unavailable; "
+                    f"fallback to raw prompt: {error_text}"
+                )
+            else:
+                logger.warning(f"OpenAIImage failed to polish natural prompt, fallback to raw prompt: {error_text}")
+
+        return cleaned_prompt
 
     async def _request_image_generation(self, prompt: str) -> dict[str, Any]:
         api_key = self._get_api_key()
