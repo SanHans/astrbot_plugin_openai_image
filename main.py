@@ -91,7 +91,7 @@ class GenerateImageTool(FunctionTool[AstrAgentContext]):
         if not cleaned_prompt:
             return "请先给出要生成的图片描述。"
 
-        cleaned_prompt = await plugin._maybe_polish_tool_prompt(
+        cleaned_prompt, polished_prompt = await plugin._maybe_polish_tool_prompt(
             event=event,
             prompt=cleaned_prompt,
             source="llm_tool",
@@ -102,6 +102,7 @@ class GenerateImageTool(FunctionTool[AstrAgentContext]):
                 event=event,
                 prompt=cleaned_prompt,
                 source="llm_tool",
+                polished_prompt=polished_prompt,
             )
         except ValueError as exc:
             return str(exc)
@@ -155,7 +156,7 @@ class EditImageTool(FunctionTool[AstrAgentContext]):
         if not cleaned_prompt:
             return "请先说明你想怎么修改这张图片。"
 
-        cleaned_prompt = await plugin._maybe_polish_tool_prompt(
+        cleaned_prompt, polished_prompt = await plugin._maybe_polish_tool_prompt(
             event=event,
             prompt=cleaned_prompt,
             source="llm_tool_edit",
@@ -166,6 +167,7 @@ class EditImageTool(FunctionTool[AstrAgentContext]):
                 event=event,
                 prompt=cleaned_prompt,
                 source="llm_tool_edit",
+                polished_prompt=polished_prompt,
             )
         except ValueError as exc:
             return str(exc)
@@ -224,12 +226,9 @@ class OpenAIImagePlugin(Star):
             self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
         return self._session
 
-    def _get_legacy_timeout(self) -> int:
-        return max(5, int(self.config.get("timeout", 180) or 180))
-
     def _get_generation_timeout(self) -> int:
-        value = self.config.get("generation_timeout", self._get_legacy_timeout())
-        return max(5, int(value or self._get_legacy_timeout()))
+        value = self.config.get("generation_timeout", 180)
+        return max(5, int(value or 180))
 
     def _get_download_timeout(self) -> int:
         fallback = min(self._get_generation_timeout(), 60)
@@ -509,10 +508,10 @@ class OpenAIImagePlugin(Star):
         event: AstrMessageEvent,
         prompt: str,
         source: str,
-    ) -> str:
+    ) -> tuple[str, str | None]:
         cleaned_prompt = self._cleanup_prompt(prompt)
         if not cleaned_prompt or not self._is_natural_language_polish_enabled():
-            return cleaned_prompt
+            return cleaned_prompt, None
 
         platform_context = self._get_platform_context(event)
         provider = self.context.get_using_provider(umo=event.unified_msg_origin)
@@ -521,7 +520,7 @@ class OpenAIImagePlugin(Star):
                 "warning",
                 f"OpenAIImage natural language polish skipped source={source}: no provider found; fallback to raw prompt",
             )
-            return cleaned_prompt
+            return cleaned_prompt, None
 
         system_prompt = self._get_natural_language_polish_prompt()
         user_prompt = cleaned_prompt
@@ -557,7 +556,7 @@ class OpenAIImagePlugin(Star):
                 logger.info(
                     f"OpenAIImage polished natural prompt source={source} original={cleaned_prompt} polished={polished_prompt}"
                 )
-                return polished_prompt
+                return polished_prompt, polished_prompt
         except Exception as exc:
             error_text = str(exc)
             if "auth_unavailable" in error_text:
@@ -568,7 +567,7 @@ class OpenAIImagePlugin(Star):
             else:
                 logger.warning(f"OpenAIImage failed to polish natural prompt, fallback to raw prompt: {error_text}")
 
-        return cleaned_prompt
+        return cleaned_prompt, None
 
     async def _request_image_generation(self, prompt: str) -> dict[str, Any]:
         api_key = self._get_api_key()
@@ -838,13 +837,6 @@ class OpenAIImagePlugin(Star):
 
         raise RuntimeError(f"下载图片失败：超过最大重试次数：{image_url}")
 
-    def _extract_revised_prompt(self, data: dict[str, Any]) -> str | None:
-        data_list = data.get("data")
-        if isinstance(data_list, list) and data_list and isinstance(data_list[0], dict):
-            revised_prompt = str(data_list[0].get("revised_prompt") or "").strip()
-            return revised_prompt or None
-        return None
-
     async def _collect_image_files(self, data: dict[str, Any]) -> list[str]:
         image_files: list[str] = []
         images = data.get("data", [])
@@ -876,11 +868,15 @@ class OpenAIImagePlugin(Star):
         response: dict[str, Any],
         source: str,
         final_preamble_texts: list[str] | None = None,
+        polished_prompt: str | None = None,
     ) -> None:
-        revised_prompt = self._extract_revised_prompt(response)
         preamble_texts = list(final_preamble_texts or [])
-        if self.config.get("send_prompt_back", False) and revised_prompt:
-            preamble_texts.append(f"最终提示词：{revised_prompt}")
+        if (
+            self.config.get("send_prompt_back", False)
+            and self._is_natural_language_polish_enabled()
+            and polished_prompt
+        ):
+            preamble_texts.append(f"最终提示词：{polished_prompt}")
         image_files = await self._collect_image_files(response)
         chain = self._build_message_chain(image_files, preamble_texts=preamble_texts)
         await self._send_message_chain(
@@ -944,6 +940,7 @@ class OpenAIImagePlugin(Star):
         source: str,
         platform_context: dict[str, Any],
         final_preamble_texts: list[str] | None = None,
+        polished_prompt: str | None = None,
     ) -> None:
         async with self._semaphore:
             try:
@@ -957,6 +954,7 @@ class OpenAIImagePlugin(Star):
                     response=response,
                     source=source,
                     final_preamble_texts=final_preamble_texts,
+                    polished_prompt=polished_prompt,
                 )
             except ValueError as exc:
                 logger.warning(f"OpenAIImage invalid config: {exc}")
@@ -996,6 +994,7 @@ class OpenAIImagePlugin(Star):
         source: str,
         platform_context: dict[str, Any],
         final_preamble_texts: list[str] | None = None,
+        polished_prompt: str | None = None,
     ) -> None:
         async with self._semaphore:
             try:
@@ -1010,6 +1009,7 @@ class OpenAIImagePlugin(Star):
                     response=response,
                     source=source,
                     final_preamble_texts=final_preamble_texts,
+                    polished_prompt=polished_prompt,
                 )
             except ValueError as exc:
                 logger.warning(f"OpenAIImage invalid edit input/config: {exc}")
@@ -1047,6 +1047,7 @@ class OpenAIImagePlugin(Star):
         source: str,
         initial_reply_text: str | None = None,
         final_preamble_texts: list[str] | None = None,
+        polished_prompt: str | None = None,
     ) -> str | None:
         final_prompt = self._compose_prompt(prompt)
         if not final_prompt:
@@ -1071,6 +1072,7 @@ class OpenAIImagePlugin(Star):
                 source=source,
                 platform_context=platform_context,
                 final_preamble_texts=effective_final_preamble_texts,
+                polished_prompt=polished_prompt,
             )
         )
         return initial_reply_text if send_initial_reply else None
@@ -1083,6 +1085,7 @@ class OpenAIImagePlugin(Star):
         initial_reply_text: str | None = None,
         final_preamble_texts: list[str] | None = None,
         use_mask: bool = False,
+        polished_prompt: str | None = None,
     ) -> str | None:
         final_prompt = self._compose_prompt(prompt)
         if not final_prompt:
@@ -1115,6 +1118,7 @@ class OpenAIImagePlugin(Star):
                 source=source,
                 platform_context=platform_context,
                 final_preamble_texts=effective_final_preamble_texts,
+                polished_prompt=polished_prompt,
             )
         )
         return initial_reply_text if send_initial_reply else None

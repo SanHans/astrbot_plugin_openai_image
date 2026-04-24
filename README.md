@@ -49,7 +49,7 @@ AstrBot/data/plugins/astrbot_plugin_openai_image
 - `retry_backoff_seconds`：重试退避秒数，默认 `2`
 - `proxy_url`：可选代理地址，会同时用于生图请求和远程图片下载
 - `natural_language_polish_enabled`：是否对 Agent 传给工具的自然语言提示词再做一次轻量润色，默认关闭
-- `natural_language_polish_prompt_template`：自然语言优化提示词，可自行修改；直接填写中文提示词正文，不需要变量
+- `natural_language_polish_prompt_template`：自然语言优化提示词，可自行修改；直接填写优化提示词正文，不需要变量
 - `detailed_logging`：输出更详细的插件日志
 - `size`：默认 `auto`，也可以填 `1024x1024`、`1536x1024`、`1024x1536` 等
 - `quality`：`auto` / `low` / `medium` / `high`

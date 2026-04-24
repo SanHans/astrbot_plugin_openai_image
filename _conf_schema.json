@@ -18,14 +18,6 @@
     "default": "gpt-image-2",
     "hint": "默认使用 OpenAI 官方的 gpt-image-2，也可以改成兼容服务上的其他图像模型名。"
   },
-  "timeout": {
-    "type": "int",
-    "description": "统一超时兜底（秒）",
-    "default": 180,
-    "min": 30,
-    "max": 600,
-    "hint": "兼容旧配置。若未单独配置 generation_timeout / download_timeout，则分别回退到这里或其衍生值。"
-  },
   "generation_timeout": {
     "type": "int",
     "description": "生图请求超时时间（秒）",
@@ -160,8 +152,8 @@
   },
   "send_prompt_back": {
     "type": "bool",
-    "description": "返回修订后的提示词",
+    "description": "返回润色后的提示词",
     "default": false,
-    "hint": "仅当上游接口返回 revised_prompt 时才会发送。"
+    "hint": "仅在开启自然语言提示词润色后生效。开启后，最终回传图片时会额外附带插件本地润色后的提示词。"
   }
 }
