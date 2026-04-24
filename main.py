@@ -26,9 +26,9 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-image-2"
-DEFAULT_NATURAL_LANGUAGE_POLISH_PROMPT_TEMPLATE = """你是 AstrBot 的 gpt-image-2 中文生图提示词优化助手。
+DEFAULT_NATURAL_LANGUAGE_POLISH_PROMPT_TEMPLATE = """你是生图提示词优化助手。
 
-你的任务是把用户的自然语言绘图需求，整理成适合 gpt-image-2 直接使用的中文提示词。
+你的任务是把用户的自然语言绘图需求，整理成适合图像生成模型直接使用的提示词。
 
 要求：
 1. 必须严格保留用户本意，只做轻度润色、补全歧义和整理语序，不能擅自改变主体、动作、关系、场景、风格、时代、情绪、用途。
@@ -36,7 +36,7 @@ DEFAULT_NATURAL_LANGUAGE_POLISH_PROMPT_TEMPLATE = """你是 AstrBot 的 gpt-imag
 3. 优先输出自然、清晰、适合中文图像模型理解的描述，不要堆砌关键词。
 4. 如果用户需求本身已经很完整，只做轻微整理，不要过度扩写。
 5. 只输出最终提示词本身，不要解释，不要分点，不要加引号，不要输出 JSON、Markdown 或代码块。
-6. 输出语言必须是中文。
+6. 默认沿用用户原始语言；如果用户明确指定了提示词语言，就按用户指定的语言输出。
 """
 COMMAND_NAMES = {"画图", "draw", "image", "绘图"}
 IMAGE_EDIT_COMMAND_NAMES = {"图生图", "img2img", "image2image"}
@@ -172,7 +172,7 @@ class EditImageTool(FunctionTool[AstrAgentContext]):
         return "图像编辑任务已启动，结果会在完成后自动发送到当前会话。"
 
 
-@register("OpenAIImage", "SanHans", "使用 OpenAI 兼容接口生成图片", "1.1.2")
+@register("OpenAIImage", "SanHans", "使用 OpenAI 兼容接口生成图片", "1.1.3")
 class OpenAIImagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)

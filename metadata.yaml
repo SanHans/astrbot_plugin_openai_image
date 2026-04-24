@@ -2,6 +2,6 @@ name: astrbot_plugin_openai_image
 display_name: OpenAI 画图
 desc: 使用 OpenAI 兼容图像接口生成、改图和修图，支持 /画图、/图生图、/修图 和 LLM Tool。
 help: 使用 /画图、/图生图、/修图，或在普通对话中让 AstrBot Agent 自行调用 generate_image / edit_image 工具。
-version: v1.1.2
+version: v1.1.3
 author: SanHans
 repo: https://github.com/SanHans/astrbot_plugin_openai_image
