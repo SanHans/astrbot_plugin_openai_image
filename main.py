@@ -17,6 +17,7 @@ from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import File, Image
 from astrbot.api.star import Context, Star, register
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult
@@ -26,6 +27,9 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-image-2"
 COMMAND_NAMES = {"画图", "draw", "image", "绘图"}
+IMAGE_EDIT_COMMAND_NAMES = {"图生图", "img2img", "image2image"}
+RETOUCH_COMMAND_NAMES = {"修图", "改图", "edit", "inpaint"}
+ALL_COMMAND_NAMES = COMMAND_NAMES | IMAGE_EDIT_COMMAND_NAMES | RETOUCH_COMMAND_NAMES
 
 
 @pydantic_dataclass
@@ -86,7 +90,65 @@ class GenerateImageTool(FunctionTool[AstrAgentContext]):
         return "图像生成任务已启动，结果会在完成后自动发送到当前会话。"
 
 
-@register("OpenAIImage", "SanHans", "使用 OpenAI 兼容接口生成图片", "1.0.8")
+@pydantic_dataclass
+class EditImageTool(FunctionTool[AstrAgentContext]):
+    """根据用户提供的图片进行图生图或修图，并在完成后推送到当前会话。"""
+
+    name: str = "edit_image"
+    description: str = "当用户要求修改当前消息附带的图片、给现有图片换风格、局部修图、重绘或图生图时调用。需要用户当前消息里已经带有至少一张图片。"
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "将用户对现有图片的修改要求尽量原样传给图像编辑模型，不要擅自改变原意。",
+                }
+            },
+            "required": ["prompt"],
+        }
+    )
+    plugin: Any = None
+
+    async def call(
+        self,
+        context: ContextWrapper[AstrAgentContext],
+        **kwargs: Any,
+    ) -> ToolExecResult:
+        prompt = str(kwargs.get("prompt") or "").strip()
+        if not prompt:
+            return "请先说明你想怎么修改这张图片。"
+
+        plugin = self.plugin
+        if not plugin:
+            return "图片插件未正确初始化。"
+
+        event = None
+        if hasattr(context, "context") and isinstance(context.context, AstrAgentContext):
+            event = context.context.event
+        elif isinstance(context, dict):
+            event = context.get("event")
+
+        if not event:
+            logger.warning("OpenAIImage edit tool call missing event context")
+            return "当前无法获取会话上下文，暂时不能直接发送图片。"
+
+        cleaned_prompt = plugin._cleanup_prompt(prompt)
+        if not cleaned_prompt:
+            return "请先说明你想怎么修改这张图片。"
+
+        try:
+            await plugin._queue_edit_task(
+                event=event,
+                prompt=cleaned_prompt,
+                source="llm_tool_edit",
+            )
+        except ValueError as exc:
+            return str(exc)
+        return "图像编辑任务已启动，结果会在完成后自动发送到当前会话。"
+
+
+@register("OpenAIImage", "SanHans", "使用 OpenAI 兼容接口生成图片", "1.1.0")
 class OpenAIImagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -101,7 +163,7 @@ class OpenAIImagePlugin(Star):
 
     async def initialize(self):
         if not self._tool_registered:
-            self.context.add_llm_tools(GenerateImageTool(plugin=self))
+            self.context.add_llm_tools(GenerateImageTool(plugin=self), EditImageTool(plugin=self))
             self._tool_registered = True
 
     async def terminate(self):
@@ -189,13 +251,20 @@ class OpenAIImagePlugin(Star):
         log_func = getattr(logger, level, logger.info)
         log_func(message)
 
-    def _get_base_url(self) -> str:
+    def _get_api_root_url(self) -> str:
         base_url = str(self.config.get("base_url") or DEFAULT_BASE_URL).strip().rstrip("/")
         if not base_url:
             base_url = DEFAULT_BASE_URL
-        if base_url.endswith("/images/generations"):
-            return base_url
-        return f"{base_url}/images/generations"
+        for suffix in ("/images/generations", "/images/edits"):
+            if base_url.endswith(suffix):
+                return base_url[: -len(suffix)]
+        return base_url
+
+    def _get_generation_url(self) -> str:
+        return f"{self._get_api_root_url()}/images/generations"
+
+    def _get_edits_url(self) -> str:
+        return f"{self._get_api_root_url()}/images/edits"
 
     def _build_payload(self, prompt: str) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -289,11 +358,66 @@ class OpenAIImagePlugin(Star):
         tokens = full.split()
         if tokens:
             command = tokens[0].lstrip("/").lower()
-            if command in {name.lower() for name in COMMAND_NAMES}:
+            if command in {name.lower() for name in ALL_COMMAND_NAMES}:
                 tokens = tokens[1:]
 
         reconstructed = " ".join(tokens).strip()
         return self._cleanup_prompt(reconstructed or raw_prompt)
+
+    @staticmethod
+    def _is_supported_image_file(file_path: str) -> bool:
+        if not file_path:
+            return False
+        mime_type, _ = mimetypes.guess_type(file_path)
+        if mime_type and mime_type.startswith("image/"):
+            return True
+        extension = os.path.splitext(file_path)[1].lower()
+        return extension in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+
+    @staticmethod
+    def _guess_mime_type_from_path(file_path: str) -> str:
+        mime_type, _ = mimetypes.guess_type(file_path)
+        return mime_type or "application/octet-stream"
+
+    @staticmethod
+    def _iter_message_components(event: AstrMessageEvent) -> list[Any]:
+        message_obj = getattr(event, "message_obj", None)
+        if not message_obj:
+            return []
+
+        for attr_name in ("message", "chain", "messages"):
+            components = getattr(message_obj, attr_name, None)
+            if isinstance(components, list):
+                return components
+        return []
+
+    async def _extract_input_images(self, event: AstrMessageEvent) -> list[str]:
+        image_paths: list[str] = []
+
+        async def _collect_from_components(components: list[Any]) -> None:
+            for component in components:
+                if isinstance(component, Image):
+                    file_path = await component.convert_to_file_path()
+                    if file_path and os.path.exists(file_path):
+                        image_paths.append(os.path.abspath(file_path))
+                    continue
+
+                if isinstance(component, File):
+                    file_path = await component.get_file()
+                    if file_path and os.path.exists(file_path) and self._is_supported_image_file(file_path):
+                        image_paths.append(os.path.abspath(file_path))
+                    continue
+
+                reply_chain = getattr(component, "chain", None)
+                if isinstance(reply_chain, list) and reply_chain:
+                    await _collect_from_components(reply_chain)
+
+        await _collect_from_components(self._iter_message_components(event))
+        self._log_detail(
+            "info",
+            f"OpenAIImage extracted {len(image_paths)} input image(s) from current event: {image_paths}",
+        )
+        return image_paths
 
     @staticmethod
     def _normalize_error_message(message: str) -> str:
@@ -327,9 +451,19 @@ class OpenAIImagePlugin(Star):
 
         return re.sub(r"\s+", " ", text)
 
+    @staticmethod
+    def _parse_json_response_text(text: str) -> dict[str, Any]:
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return {"raw_text": text}
+        if isinstance(data, dict):
+            return data
+        return {"raw_data": data}
+
     async def _request_image_generation(self, prompt: str) -> dict[str, Any]:
         api_key = self._get_api_key()
-        endpoint = self._get_base_url()
+        endpoint = self._get_generation_url()
         if not api_key:
             raise ValueError("未配置 API Key。请在插件配置中填写 api_key，或设置环境变量 OPENAI_API_KEY。")
         if not endpoint.startswith(("http://", "https://")):
@@ -402,6 +536,117 @@ class OpenAIImagePlugin(Star):
                     await self._sleep_before_retry(attempt)
                     continue
                 raise
+
+        raise RuntimeError("请求失败：超过最大重试次数")
+
+    async def _request_image_edit(
+        self,
+        prompt: str,
+        image_path: str,
+        mask_path: str | None = None,
+    ) -> dict[str, Any]:
+        api_key = self._get_api_key()
+        endpoint = self._get_edits_url()
+        if not api_key:
+            raise ValueError("未配置 API Key。请在插件配置中填写 api_key，或设置环境变量 OPENAI_API_KEY。")
+        if not endpoint.startswith(("http://", "https://")):
+            raise ValueError("base_url 必须以 http:// 或 https:// 开头，并建议填写到 /v1。")
+        if not os.path.exists(image_path):
+            raise ValueError("未找到要编辑的原图文件。")
+        if mask_path and not os.path.exists(mask_path):
+            raise ValueError("未找到修图遮罩文件。")
+
+        payload = self._build_payload(prompt)
+        session = await self._ensure_session()
+        headers = {"Authorization": f"Bearer {api_key}"}
+        generation_timeout = self._get_generation_timeout()
+        retry_count = self._get_retry_count()
+        total_attempts = retry_count + 1
+        proxy_url = self._get_proxy_url()
+        self._log_detail(
+            "info",
+            f"OpenAIImage edit request endpoint={endpoint} model={payload.get('model')} size={payload.get('size')} "
+            f"quality={payload.get('quality')} n={payload.get('n')} moderation={payload.get('moderation')} "
+            f"timeout={generation_timeout}s retries={retry_count} proxy={proxy_url or 'none'} "
+            f"image={image_path} mask={mask_path or 'none'} prompt={prompt}",
+        )
+
+        for attempt in range(1, total_attempts + 1):
+            started_at = time.monotonic()
+            form = aiohttp.FormData()
+            for key, value in payload.items():
+                form.add_field(key, str(value))
+
+            try:
+                with open(image_path, "rb") as image_file:
+                    form.add_field(
+                        "image",
+                        image_file,
+                        filename=os.path.basename(image_path),
+                        content_type=self._guess_mime_type_from_path(image_path),
+                    )
+                    if mask_path:
+                        with open(mask_path, "rb") as mask_file:
+                            form.add_field(
+                                "mask",
+                                mask_file,
+                                filename=os.path.basename(mask_path),
+                                content_type=self._guess_mime_type_from_path(mask_path),
+                            )
+                            async with session.post(
+                                endpoint,
+                                headers=headers,
+                                data=form,
+                                **self._build_request_kwargs(generation_timeout),
+                            ) as response:
+                                text = await response.text()
+                                data = self._parse_json_response_text(text)
+                    else:
+                        async with session.post(
+                            endpoint,
+                            headers=headers,
+                            data=form,
+                            **self._build_request_kwargs(generation_timeout),
+                        ) as response:
+                            text = await response.text()
+                            data = self._parse_json_response_text(text)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                duration = time.monotonic() - started_at
+                if attempt < total_attempts:
+                    logger.warning(
+                        f"OpenAIImage edit request exception attempt={attempt}/{total_attempts} "
+                        f"took={duration:.2f}s retrying: {exc}"
+                    )
+                    await self._sleep_before_retry(attempt)
+                    continue
+                raise
+
+            duration = time.monotonic() - started_at
+            data_count = len(data.get("data", [])) if isinstance(data.get("data"), list) else 0
+            status = response.status
+            self._log_detail(
+                "info",
+                f"OpenAIImage edit response status={status} took={duration:.2f}s "
+                f"attempt={attempt}/{total_attempts} data_count={data_count} "
+                f"keys={list(data.keys()) if isinstance(data, dict) else type(data)}",
+            )
+
+            if status >= 400:
+                error_message = (
+                    data.get("error", {}).get("message")
+                    if isinstance(data.get("error"), dict)
+                    else data.get("error")
+                ) or data.get("message") or text
+                if attempt < total_attempts and self._should_retry_status(status):
+                    logger.warning(
+                        f"OpenAIImage edit request failed with retryable status={status} "
+                        f"attempt={attempt}/{total_attempts} retrying: {self._normalize_error_message(error_message)}"
+                    )
+                    await self._sleep_before_retry(attempt)
+                    continue
+                raise RuntimeError(f"请求失败（{status}）：{error_message}")
+
+            return data
 
         raise RuntimeError("请求失败：超过最大重试次数")
 
@@ -516,6 +761,28 @@ class OpenAIImagePlugin(Star):
         self._log_detail("info", f"OpenAIImage prepared {len(image_files)} image file(s) for sending")
         return image_files
 
+    async def _send_success_response(
+        self,
+        unified_msg_origin: str,
+        response: dict[str, Any],
+        source: str,
+        final_preamble_texts: list[str] | None = None,
+    ) -> None:
+        revised_prompt = self._extract_revised_prompt(response)
+        preamble_texts = list(final_preamble_texts or [])
+        if self.config.get("send_prompt_back", False) and revised_prompt:
+            preamble_texts.append(f"最终提示词：{revised_prompt}")
+        image_files = await self._collect_image_files(response)
+        chain = self._build_message_chain(image_files, preamble_texts=preamble_texts)
+        await self._send_message_chain(
+            unified_msg_origin=unified_msg_origin,
+            chain=chain,
+            source=source,
+            stage="final",
+            text_count=len([text for text in preamble_texts if text]),
+            image_count=len(image_files),
+        )
+
     def _build_message_chain(
         self,
         image_files: list[str],
@@ -576,19 +843,11 @@ class OpenAIImagePlugin(Star):
                     f"platform_id={platform_context['platform_id']} prompt={prompt}"
                 )
                 response = await self._request_image_generation(prompt)
-                revised_prompt = self._extract_revised_prompt(response)
-                preamble_texts = list(final_preamble_texts or [])
-                if self.config.get("send_prompt_back", False) and revised_prompt:
-                    preamble_texts.append(f"最终提示词：{revised_prompt}")
-                image_files = await self._collect_image_files(response)
-                chain = self._build_message_chain(image_files, preamble_texts=preamble_texts)
-                await self._send_message_chain(
+                await self._send_success_response(
                     unified_msg_origin=unified_msg_origin,
-                    chain=chain,
+                    response=response,
                     source=source,
-                    stage="final",
-                    text_count=len([text for text in preamble_texts if text]),
-                    image_count=len(image_files),
+                    final_preamble_texts=final_preamble_texts,
                 )
             except ValueError as exc:
                 logger.warning(f"OpenAIImage invalid config: {exc}")
@@ -616,6 +875,59 @@ class OpenAIImagePlugin(Star):
                 await self._send_error_message(
                     unified_msg_origin,
                     f"❌ 生成失败: {self._normalize_error_message(exc)}",
+                    source,
+                )
+
+    async def _run_edit_task(
+        self,
+        unified_msg_origin: str,
+        prompt: str,
+        image_path: str,
+        mask_path: str | None,
+        source: str,
+        platform_context: dict[str, Any],
+        final_preamble_texts: list[str] | None = None,
+    ) -> None:
+        async with self._semaphore:
+            try:
+                logger.info(
+                    f"OpenAIImage edit request source={source} platform={platform_context['platform_name']} "
+                    f"platform_id={platform_context['platform_id']} image={image_path} mask={mask_path or 'none'} "
+                    f"prompt={prompt}"
+                )
+                response = await self._request_image_edit(prompt, image_path=image_path, mask_path=mask_path)
+                await self._send_success_response(
+                    unified_msg_origin=unified_msg_origin,
+                    response=response,
+                    source=source,
+                    final_preamble_texts=final_preamble_texts,
+                )
+            except ValueError as exc:
+                logger.warning(f"OpenAIImage invalid edit input/config: {exc}")
+                await self._send_error_message(
+                    unified_msg_origin,
+                    f"❌ 修图失败: {self._normalize_error_message(exc)}",
+                    source,
+                )
+            except aiohttp.ClientError as exc:
+                logger.error(f"OpenAIImage edit network error: {exc}")
+                await self._send_error_message(
+                    unified_msg_origin,
+                    f"❌ 修图失败: 网络请求失败：{self._normalize_error_message(exc)}",
+                    source,
+                )
+            except asyncio.TimeoutError:
+                logger.error("OpenAIImage edit request timed out")
+                await self._send_error_message(
+                    unified_msg_origin,
+                    "❌ 修图失败: 请求超时，请稍后重试。",
+                    source,
+                )
+            except Exception as exc:
+                logger.exception(f"OpenAIImage edit failed: {exc}")
+                await self._send_error_message(
+                    unified_msg_origin,
+                    f"❌ 修图失败: {self._normalize_error_message(exc)}",
                     source,
                 )
 
@@ -654,6 +966,50 @@ class OpenAIImagePlugin(Star):
         )
         return initial_reply_text if send_initial_reply else None
 
+    async def _queue_edit_task(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        source: str,
+        initial_reply_text: str | None = None,
+        final_preamble_texts: list[str] | None = None,
+        use_mask: bool = False,
+    ) -> str | None:
+        final_prompt = self._compose_prompt(prompt)
+        if not final_prompt:
+            raise ValueError("请输入你希望如何修改图片，例如：/修图 改成赛博朋克夜景风格")
+
+        input_images = await self._extract_input_images(event)
+        if not input_images:
+            raise ValueError("请在同一条消息里附带至少一张图片，再使用图生图或修图命令。")
+
+        source_image_path = input_images[0]
+        mask_image_path = input_images[1] if use_mask and len(input_images) > 1 else None
+        platform_context = self._get_platform_context(event)
+        send_initial_reply = bool(initial_reply_text and platform_context["allow_initial_reply"])
+        effective_final_preamble_texts = list(final_preamble_texts or [])
+        if initial_reply_text and not send_initial_reply:
+            effective_final_preamble_texts.insert(0, initial_reply_text)
+
+        self._log_detail(
+            "info",
+            f"OpenAIImage queue edit source={source} platform={platform_context['platform_name']} "
+            f"send_initial_reply={send_initial_reply} final_preamble_count={len(effective_final_preamble_texts)} "
+            f"image={source_image_path} mask={mask_image_path or 'none'} prompt={final_prompt}",
+        )
+        self._create_background_task(
+            self._run_edit_task(
+                unified_msg_origin=event.unified_msg_origin,
+                prompt=final_prompt,
+                image_path=source_image_path,
+                mask_path=mask_image_path,
+                source=source,
+                platform_context=platform_context,
+                final_preamble_texts=effective_final_preamble_texts,
+            )
+        )
+        return initial_reply_text if send_initial_reply else None
+
     @filter.command("画图", alias={"draw", "image", "绘图"})
     async def draw_image(self, event: AstrMessageEvent, prompt: str = ""):
         """使用 OpenAI 图像模型生成图片。"""
@@ -668,6 +1024,49 @@ class OpenAIImagePlugin(Star):
                 prompt=command_prompt,
                 source="command",
                 initial_reply_text="正在生成图片，请稍等……",
+            )
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
+        if initial_reply:
+            yield event.plain_result(initial_reply)
+
+    @filter.command("图生图", alias={"img2img", "image2image"})
+    async def image_to_image(self, event: AstrMessageEvent, prompt: str = ""):
+        """基于用户附带的原图生成新图片。"""
+        command_prompt = self._extract_command_prompt(event, prompt)
+        if not command_prompt:
+            yield event.plain_result("请输入修改要求，并在同一条消息里附带原图，例如：/图生图 改成吉卜力动画风")
+            return
+
+        try:
+            initial_reply = await self._queue_edit_task(
+                event=event,
+                prompt=command_prompt,
+                source="img2img_command",
+                initial_reply_text="正在根据原图生成图片，请稍等……",
+            )
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
+        if initial_reply:
+            yield event.plain_result(initial_reply)
+
+    @filter.command("修图", alias={"改图", "edit", "inpaint"})
+    async def edit_image(self, event: AstrMessageEvent, prompt: str = ""):
+        """基于用户附带的原图进行修图。第二张图片会被当作遮罩使用。"""
+        command_prompt = self._extract_command_prompt(event, prompt)
+        if not command_prompt:
+            yield event.plain_result("请输入修图要求，并在同一条消息里附带原图，例如：/修图 去掉背景里的路人")
+            return
+
+        try:
+            initial_reply = await self._queue_edit_task(
+                event=event,
+                prompt=command_prompt,
+                source="edit_command",
+                initial_reply_text="正在修图，请稍等……",
+                use_mask=True,
             )
         except ValueError as exc:
             yield event.plain_result(str(exc))
