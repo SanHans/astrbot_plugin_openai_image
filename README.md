@@ -17,7 +17,7 @@
 - `/图生图` 和 `/修图`：直接读取当前消息链里的图片，不依赖平台私有字段；`/修图` 在有第二张图片时会把第二张图作为 `mask`
 - 普通自然语言对话：不再由插件直接拦截，而是交给 AstrBot Agent 按当前人格正常回复；当 Agent 判断用户是在要图片或改图时，再调用对应工具
 - `LLM Tool`：会注册 `generate_image` 和 `edit_image` 两个工具，工具本身只负责启动任务并把最终图片主动推送回当前会话
-- 可选自然语言润色：可以开启 `natural_language_polish_enabled`，让插件在 Agent 调用工具后，再按你自定义的润色模板做一次轻量整理
+- 可选自然语言润色：可以开启 `natural_language_polish_enabled`，让插件在 Agent 调用工具后，再按你自定义的中文优化提示词做一次轻量整理
 
 ## 文件结构
 
@@ -49,7 +49,7 @@ AstrBot/data/plugins/astrbot_plugin_openai_image
 - `retry_backoff_seconds`：重试退避秒数，默认 `2`
 - `proxy_url`：可选代理地址，会同时用于生图请求和远程图片下载
 - `natural_language_polish_enabled`：是否对 Agent 传给工具的自然语言提示词再做一次轻量润色，默认关闭
-- `natural_language_polish_prompt_template`：自然语言润色模板，可自行修改
+- `natural_language_polish_prompt_template`：自然语言优化提示词，可自行修改；直接填写中文提示词正文，不需要变量
 - `detailed_logging`：输出更详细的插件日志
 - `size`：默认 `auto`，也可以填 `1024x1024`、`1536x1024`、`1024x1536` 等
 - `quality`：`auto` / `low` / `medium` / `high`

@@ -26,20 +26,17 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-image-2"
-DEFAULT_NATURAL_LANGUAGE_POLISH_PROMPT_TEMPLATE = """你是 AstrBot 画图插件的自然语言提示词整理器。
-请把“用户原话”整理成适合图像生成模型直接使用的最终提示词。
+DEFAULT_NATURAL_LANGUAGE_POLISH_PROMPT_TEMPLATE = """你是 AstrBot 的 gpt-image-2 中文生图提示词优化助手。
 
-规则：
-1. 必须保留用户本意，只做轻度润色和必要补全，不得擅自改变主体、动作、关系、场景、风格、时代、情绪和媒介。
-2. 如果用户没有明确指定风格，不要擅自添加二次元、写实、电影感、赛博朋克等强风格词。
-3. 不要添加大量画质、镜头、构图、光照标签，不要把简单需求扩写成堆砌关键词。
-4. 输出必须只有最终提示词本身，不要解释，不要 JSON，不要 Markdown，不要代码块，不要额外客套话。
+你的任务是把用户的自然语言绘图需求，整理成适合 gpt-image-2 直接使用的中文提示词。
 
-平台类型：
-{{platform_name}}
-
-用户原话：
-{{user_prompt}}
+要求：
+1. 必须严格保留用户本意，只做轻度润色、补全歧义和整理语序，不能擅自改变主体、动作、关系、场景、风格、时代、情绪、用途。
+2. 如果用户没有明确指定画风，不要强行添加二次元、写实、电影感、赛博朋克、摄影参数、镜头语言、构图术语、画质标签。
+3. 优先输出自然、清晰、适合中文图像模型理解的描述，不要堆砌关键词。
+4. 如果用户需求本身已经很完整，只做轻微整理，不要过度扩写。
+5. 只输出最终提示词本身，不要解释，不要分点，不要加引号，不要输出 JSON、Markdown 或代码块。
+6. 输出语言必须是中文。
 """
 COMMAND_NAMES = {"画图", "draw", "image", "绘图"}
 IMAGE_EDIT_COMMAND_NAMES = {"图生图", "img2img", "image2image"}
@@ -175,7 +172,7 @@ class EditImageTool(FunctionTool[AstrAgentContext]):
         return "图像编辑任务已启动，结果会在完成后自动发送到当前会话。"
 
 
-@register("OpenAIImage", "SanHans", "使用 OpenAI 兼容接口生成图片", "1.1.1")
+@register("OpenAIImage", "SanHans", "使用 OpenAI 兼容接口生成图片", "1.1.2")
 class OpenAIImagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -501,19 +498,11 @@ class OpenAIImagePlugin(Star):
             prompt = prompt.strip('"\'')
         return prompt.strip().strip('"\'')
 
-    def _render_natural_language_polish_prompt(
-        self,
-        prompt: str,
-        platform_name: str,
-    ) -> str:
-        template = str(
+    def _get_natural_language_polish_prompt(self) -> str:
+        return str(
             self.config.get("natural_language_polish_prompt_template")
             or DEFAULT_NATURAL_LANGUAGE_POLISH_PROMPT_TEMPLATE
         ).strip()
-        return (
-            template.replace("{{user_prompt}}", prompt)
-            .replace("{{platform_name}}", platform_name or "unknown")
-        )
 
     async def _maybe_polish_tool_prompt(
         self,
@@ -534,11 +523,8 @@ class OpenAIImagePlugin(Star):
             )
             return cleaned_prompt
 
-        system_prompt = self._render_natural_language_polish_prompt(
-            prompt=cleaned_prompt,
-            platform_name=str(platform_context["platform_name"]),
-        )
-        user_prompt = "请直接输出润色后的最终提示词。"
+        system_prompt = self._get_natural_language_polish_prompt()
+        user_prompt = cleaned_prompt
 
         try:
             meta = provider.meta()
