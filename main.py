@@ -8,6 +8,7 @@ import re
 import time
 import uuid
 from collections.abc import Coroutine
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
@@ -42,6 +43,37 @@ COMMAND_NAMES = {"画图", "draw", "image", "绘图"}
 IMAGE_EDIT_COMMAND_NAMES = {"图生图", "img2img", "image2image"}
 RETOUCH_COMMAND_NAMES = {"修图", "改图", "edit", "inpaint"}
 ALL_COMMAND_NAMES = COMMAND_NAMES | IMAGE_EDIT_COMMAND_NAMES | RETOUCH_COMMAND_NAMES
+CONFIRM_KEYWORDS = {"确认", "确定", "开始", "开始生成", "确认生成", "可以", "行", "好", "ok", "yes"}
+CANCEL_KEYWORDS = {"取消", "算了", "不要了", "停", "停止", "结束"}
+ORDER_PLACEHOLDER_PATTERN = re.compile(r"(?:\[\s*图片\s*\]|\[\s*image\s*\]|\[\s*img\s*\]|\s)+", re.IGNORECASE)
+DEFAULT_PENDING_IMAGE_EXPIRE_SECONDS = 600
+DEFAULT_PENDING_CONFIRMATION_EXPIRE_SECONDS = 600
+MAX_STAGED_IMAGE_COUNT = 8
+DEFAULT_ORDER_ADJUST_PROMPT = """你是图片顺序调整解析器。
+
+你的任务是根据用户对图片顺序的自然语言要求，输出最终图片顺序。
+
+要求：
+1. 只输出 JSON，不要解释，不要代码块。
+2. JSON 格式固定为 {"order":[1,2,3]}。
+3. order 使用 1 开始的图片序号。
+4. 如果用户只调整部分顺序，其余未提及图片按原顺序补在后面。
+5. 如果用户要求不明确、无法确定、或者和现有图片数量冲突，输出 {"order":[]}。
+"""
+
+
+@dataclass
+class StagedImageBatch:
+    image_paths: list[str] = field(default_factory=list)
+    updated_at: float = field(default_factory=time.monotonic)
+
+
+@dataclass
+class PendingEditConfirmation:
+    mode: str
+    prompt: str
+    image_paths: list[str]
+    created_at: float = field(default_factory=time.monotonic)
 
 
 @pydantic_dataclass
@@ -174,7 +206,7 @@ class EditImageTool(FunctionTool[AstrAgentContext]):
         return "图像编辑任务已启动，结果会在完成后自动发送到当前会话。"
 
 
-@register("OpenAIImage", "SanHans", "使用 OpenAI 兼容接口生成图片", "1.1.3")
+@register("OpenAIImage", "SanHans", "使用 OpenAI 兼容接口生成图片", "1.1.5")
 class OpenAIImagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -182,6 +214,8 @@ class OpenAIImagePlugin(Star):
         self._session: aiohttp.ClientSession | None = None
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._tool_registered = False
+        self._staged_images: dict[str, StagedImageBatch] = {}
+        self._pending_edit_confirmations: dict[str, PendingEditConfirmation] = {}
         max_concurrent_tasks = int(self.config.get("max_concurrent_tasks", 3) or 3)
         self._semaphore = asyncio.Semaphore(max(1, max_concurrent_tasks))
         self._image_temp_dir = os.path.abspath("data/temp/openai_image")
@@ -276,6 +310,111 @@ class OpenAIImagePlugin(Star):
             return
         log_func = getattr(logger, level, logger.info)
         log_func(message)
+
+    def _get_pending_image_expire_seconds(self) -> int:
+        return DEFAULT_PENDING_IMAGE_EXPIRE_SECONDS
+
+    def _get_pending_confirmation_expire_seconds(self) -> int:
+        return DEFAULT_PENDING_CONFIRMATION_EXPIRE_SECONDS
+
+    @staticmethod
+    def _normalize_message_text(text: str) -> str:
+        return ORDER_PLACEHOLDER_PATTERN.sub(" ", str(text or "")).strip()
+
+    @staticmethod
+    def _sanitize_image_paths(image_paths: list[str]) -> list[str]:
+        return [os.path.abspath(path) for path in image_paths if path and os.path.exists(path)]
+
+    def _extract_sender_id(self, event: AstrMessageEvent) -> str:
+        message_obj = getattr(event, "message_obj", None)
+        sender = getattr(message_obj, "sender", None)
+        for attr_name in ("user_id", "id", "uin", "qq", "uid"):
+            value = getattr(sender, attr_name, None)
+            if value not in (None, ""):
+                return str(value)
+
+        getter = getattr(event, "get_sender_id", None)
+        if callable(getter):
+            with contextlib.suppress(Exception):
+                value = getter()
+                if value not in (None, ""):
+                    return str(value)
+
+        for attr_name in ("sender_id", "user_id", "from_user_id"):
+            value = getattr(message_obj, attr_name, None)
+            if value not in (None, ""):
+                return str(value)
+        return ""
+
+    def _get_user_scope_key(self, event: AstrMessageEvent) -> str:
+        unified_msg_origin = str(getattr(event, "unified_msg_origin", "") or "")
+        sender_id = self._extract_sender_id(event) or "unknown"
+        return f"{unified_msg_origin}::{sender_id}"
+
+    def _is_known_command_text(self, text: str) -> bool:
+        normalized_text = self._normalize_message_text(text)
+        if not normalized_text:
+            return False
+        command = normalized_text.split()[0].lstrip("/").lower()
+        return command in {name.lower() for name in ALL_COMMAND_NAMES}
+
+    def _prune_pending_state(self) -> None:
+        now = time.monotonic()
+        staged_expire = self._get_pending_image_expire_seconds()
+        confirm_expire = self._get_pending_confirmation_expire_seconds()
+
+        for key, batch in list(self._staged_images.items()):
+            batch.image_paths = self._sanitize_image_paths(batch.image_paths)
+            if not batch.image_paths or now - batch.updated_at > staged_expire:
+                self._staged_images.pop(key, None)
+
+        for key, pending in list(self._pending_edit_confirmations.items()):
+            pending.image_paths = self._sanitize_image_paths(pending.image_paths)
+            if not pending.image_paths or now - pending.created_at > confirm_expire:
+                self._pending_edit_confirmations.pop(key, None)
+
+    def _stage_images(self, event: AstrMessageEvent, image_paths: list[str]) -> None:
+        self._prune_pending_state()
+        sanitized_paths = self._sanitize_image_paths(image_paths)
+        if not sanitized_paths:
+            return
+
+        key = self._get_user_scope_key(event)
+        existing_batch = self._staged_images.get(key, StagedImageBatch())
+        combined_paths = [*existing_batch.image_paths]
+        remaining_slots = max(0, MAX_STAGED_IMAGE_COUNT - len(combined_paths))
+        if remaining_slots:
+            combined_paths.extend(sanitized_paths[:remaining_slots])
+        existing_batch.image_paths = combined_paths
+        existing_batch.updated_at = time.monotonic()
+        self._staged_images[key] = existing_batch
+        self._log_detail(
+            "info",
+            f"OpenAIImage staged {len(sanitized_paths[:remaining_slots])} image(s) for {key}: {existing_batch.image_paths}",
+        )
+
+    def _consume_staged_images(self, event: AstrMessageEvent) -> list[str]:
+        self._prune_pending_state()
+        key = self._get_user_scope_key(event)
+        batch = self._staged_images.pop(key, None)
+        if not batch:
+            return []
+        return self._sanitize_image_paths(batch.image_paths)
+
+    def _clear_staged_images(self, event: AstrMessageEvent) -> None:
+        self._staged_images.pop(self._get_user_scope_key(event), None)
+
+    def _get_pending_confirmation(self, event: AstrMessageEvent) -> PendingEditConfirmation | None:
+        self._prune_pending_state()
+        return self._pending_edit_confirmations.get(self._get_user_scope_key(event))
+
+    def _set_pending_confirmation(self, event: AstrMessageEvent, pending: PendingEditConfirmation) -> None:
+        pending.image_paths = self._sanitize_image_paths(pending.image_paths)
+        pending.created_at = time.monotonic()
+        self._pending_edit_confirmations[self._get_user_scope_key(event)] = pending
+
+    def _clear_pending_confirmation(self, event: AstrMessageEvent) -> None:
+        self._pending_edit_confirmations.pop(self._get_user_scope_key(event), None)
 
     def _get_api_root_url(self) -> str:
         base_url = str(self.config.get("base_url") or DEFAULT_BASE_URL).strip().rstrip("/")
@@ -444,6 +583,348 @@ class OpenAIImagePlugin(Star):
             f"OpenAIImage extracted {len(image_paths)} input image(s) from current event: {image_paths}",
         )
         return image_paths
+
+    async def _resolve_edit_input_images(self, event: AstrMessageEvent) -> list[str]:
+        current_images = await self._extract_input_images(event)
+        if current_images:
+            self._clear_staged_images(event)
+            return self._sanitize_image_paths(current_images)
+        return self._consume_staged_images(event)
+
+    @staticmethod
+    def _get_edit_mode_display_name(mode: str) -> str:
+        return "图生图" if mode == "img2img" else "修图"
+
+    def _build_image_role_label(self, mode: str, index: int) -> str:
+        if mode == "img2img":
+            return "主图" if index == 1 else f"参考图 {index - 1}"
+        if index == 1:
+            return "原图"
+        if index == 2:
+            return "遮罩图"
+        return f"待选图 {index - 2}"
+
+    def _build_confirmation_chain(
+        self,
+        mode: str,
+        prompt: str,
+        image_paths: list[str],
+    ) -> MessageChain:
+        chain = MessageChain()
+        lines = [
+            f"{self._get_edit_mode_display_name(mode)}要求：{prompt}",
+            f"已收到 {len(image_paths)} 张图",
+        ]
+        if mode == "img2img":
+            lines.append("第 1 张会当主图  后续图片会当参考图")
+        else:
+            lines.append("修图只会上传前 2 张  第 1 张是原图  第 2 张是遮罩图")
+        lines.extend(
+            [
+                "回复 确认 开始处理",
+                "回复 取消 放弃本次任务",
+                "顺序不对可以直接说  把第二张放第一张前面",
+            ]
+        )
+        chain.message("\n".join(lines))
+
+        for index, image_path in enumerate(image_paths, start=1):
+            chain.message(f"{index}  {self._build_image_role_label(mode, index)}")
+            chain.file_image(image_path)
+        return chain
+
+    async def _send_confirmation_preview(
+        self,
+        event: AstrMessageEvent,
+        pending: PendingEditConfirmation,
+        source: str,
+    ) -> None:
+        chain = self._build_confirmation_chain(
+            mode=pending.mode,
+            prompt=pending.prompt,
+            image_paths=pending.image_paths,
+        )
+        await self._send_message_chain(
+            unified_msg_origin=event.unified_msg_origin,
+            chain=chain,
+            source=source,
+            stage="confirm_preview",
+            text_count=1 + len(pending.image_paths),
+            image_count=len(pending.image_paths),
+        )
+
+    async def _queue_edit_confirmation(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        mode: str,
+        source: str,
+    ) -> None:
+        final_prompt = self._compose_prompt(prompt)
+        if not final_prompt:
+            if mode == "img2img":
+                raise ValueError("请输入修改要求，例如：/图生图 把第一张里的贝壳换成后面参考图里的贝壳")
+            raise ValueError("请输入修图要求，例如：/修图 去掉背景里的路人")
+
+        image_paths = await self._resolve_edit_input_images(event)
+        if not image_paths:
+            if mode == "img2img":
+                raise ValueError("请先连续发送图片，再发 /图生图 修改要求。第一张默认是主图，后续图片默认是参考图。")
+            raise ValueError("请先发送原图，再发 /修图 修改要求。第二张会被当作遮罩图。")
+
+        pending = PendingEditConfirmation(
+            mode=mode,
+            prompt=final_prompt,
+            image_paths=image_paths,
+        )
+        self._set_pending_confirmation(event, pending)
+        await self._send_confirmation_preview(event, pending, source=source)
+
+    @staticmethod
+    def _compact_message_text(text: str) -> str:
+        return re.sub(r"\s+", "", str(text or "")).strip().lower()
+
+    def _is_confirm_reply(self, text: str) -> bool:
+        return self._compact_message_text(text) in CONFIRM_KEYWORDS
+
+    def _is_cancel_reply(self, text: str) -> bool:
+        return self._compact_message_text(text) in CANCEL_KEYWORDS
+
+    @staticmethod
+    def _parse_position_token(token: str) -> int | None:
+        cleaned = str(token or "").strip()
+        if not cleaned:
+            return None
+        if cleaned.isdigit():
+            value = int(cleaned)
+            return value if value > 0 else None
+
+        mapping = {
+            "一": 1,
+            "二": 2,
+            "两": 2,
+            "三": 3,
+            "四": 4,
+            "五": 5,
+            "六": 6,
+            "七": 7,
+            "八": 8,
+            "九": 9,
+        }
+        if cleaned == "十":
+            return 10
+        if cleaned in mapping:
+            return mapping[cleaned]
+        if cleaned.startswith("十") and len(cleaned) == 2 and cleaned[1] in mapping:
+            return 10 + mapping[cleaned[1]]
+        if cleaned.endswith("十") and len(cleaned) == 2 and cleaned[0] in mapping:
+            return mapping[cleaned[0]] * 10
+        if len(cleaned) == 3 and cleaned[1] == "十" and cleaned[0] in mapping and cleaned[2] in mapping:
+            return mapping[cleaned[0]] * 10 + mapping[cleaned[2]]
+        return None
+
+    def _extract_position_numbers(self, text: str) -> list[int]:
+        matches = re.findall(r"第\s*([0-9一二两三四五六七八九十]+)\s*(?:张|个|幅|号)?", text or "")
+        numbers: list[int] = []
+        for match in matches:
+            value = self._parse_position_token(match)
+            if value is not None:
+                numbers.append(value)
+        return numbers
+
+    @staticmethod
+    def _move_order_item(order: list[int], item: int, target_index: int) -> list[int]:
+        new_order = [value for value in order if value != item]
+        target_index = max(0, min(target_index, len(new_order)))
+        new_order.insert(target_index, item)
+        return new_order
+
+    def _parse_order_adjustment_simple(
+        self,
+        instruction: str,
+        image_count: int,
+        mode: str,
+    ) -> list[int] | None:
+        if image_count <= 1:
+            return list(range(1, image_count + 1))
+
+        text = self._cleanup_prompt(instruction)
+        if not text:
+            return None
+
+        order = list(range(1, image_count + 1))
+        positions = [value for value in self._extract_position_numbers(text) if 1 <= value <= image_count]
+        unique_positions = list(dict.fromkeys(positions))
+
+        if ("交换" in text or "互换" in text or "对调" in text) and len(unique_positions) >= 2:
+            first, second = unique_positions[:2]
+            first_index = order.index(first)
+            second_index = order.index(second)
+            order[first_index], order[second_index] = order[second_index], order[first_index]
+            return order
+
+        before_match = re.search(
+            r"第\s*([0-9一二两三四五六七八九十]+)\s*(?:张|个|幅|号)?.*?"
+            r"第\s*([0-9一二两三四五六七八九十]+)\s*(?:张|个|幅|号)?.*?前面",
+            text,
+        )
+        if before_match:
+            source = self._parse_position_token(before_match.group(1))
+            target = self._parse_position_token(before_match.group(2))
+            if source and target and source != target and source in order and target in order:
+                return self._move_order_item(order, source, order.index(target))
+
+        after_match = re.search(
+            r"第\s*([0-9一二两三四五六七八九十]+)\s*(?:张|个|幅|号)?.*?"
+            r"第\s*([0-9一二两三四五六七八九十]+)\s*(?:张|个|幅|号)?.*?后面",
+            text,
+        )
+        if after_match:
+            source = self._parse_position_token(after_match.group(1))
+            target = self._parse_position_token(after_match.group(2))
+            if source and target and source != target and source in order and target in order:
+                return self._move_order_item(order, source, order.index(target) + 1)
+
+        if unique_positions:
+            first_position = unique_positions[0]
+            if any(keyword in text for keyword in ("主图", "原图", "第一张", "最前面", "排第一", "放前面", "当前面")):
+                return self._move_order_item(order, first_position, 0)
+            if "遮罩" in text and mode == "edit":
+                return self._move_order_item(order, first_position, 1)
+            if "最后" in text:
+                return self._move_order_item(order, first_position, len(order) - 1)
+            if any(keyword in text for keyword in ("第二张", "排第二", "放第二")):
+                return self._move_order_item(order, first_position, 1)
+
+        explicit_match = re.search(r"(?:顺序|改成|调整为|排成|排列为)\s*[:：]?\s*(.*)", text)
+        if explicit_match:
+            explicit_positions = [
+                value for value in self._extract_position_numbers(explicit_match.group(1))
+                if 1 <= value <= image_count
+            ]
+            explicit_unique = list(dict.fromkeys(explicit_positions))
+            if explicit_unique:
+                for index in range(1, image_count + 1):
+                    if index not in explicit_unique:
+                        explicit_unique.append(index)
+                return explicit_unique
+
+        return None
+
+    async def _parse_order_adjustment_with_llm(
+        self,
+        event: AstrMessageEvent,
+        instruction: str,
+        image_count: int,
+        mode: str,
+    ) -> list[int] | None:
+        provider = self.context.get_using_provider(umo=event.unified_msg_origin)
+        if not provider:
+            return None
+
+        user_prompt = (
+            f"当前任务：{self._get_edit_mode_display_name(mode)}\n"
+            f"当前图片数量：{image_count}\n"
+            f"当前顺序：{list(range(1, image_count + 1))}\n"
+            f"用户要求：{instruction}"
+        )
+        try:
+            llm_resp = await provider.text_chat(
+                prompt=user_prompt,
+                system_prompt=DEFAULT_ORDER_ADJUST_PROMPT,
+            )
+            data = self._parse_json_response_text(llm_resp.completion_text or "")
+            raw_order = data.get("order")
+            if not isinstance(raw_order, list):
+                return None
+
+            parsed_order: list[int] = []
+            for item in raw_order:
+                try:
+                    value = int(item)
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= value <= image_count and value not in parsed_order:
+                    parsed_order.append(value)
+
+            if not parsed_order:
+                return None
+
+            for value in range(1, image_count + 1):
+                if value not in parsed_order:
+                    parsed_order.append(value)
+            return parsed_order
+        except Exception as exc:
+            self._log_detail("warning", f"OpenAIImage failed to parse order adjustment with llm: {exc}")
+            return None
+
+    async def _resolve_adjusted_image_paths(
+        self,
+        event: AstrMessageEvent,
+        pending: PendingEditConfirmation,
+        instruction: str,
+    ) -> list[str] | None:
+        image_paths = self._sanitize_image_paths(pending.image_paths)
+        if not image_paths:
+            return None
+
+        image_count = len(image_paths)
+        order = self._parse_order_adjustment_simple(
+            instruction=instruction,
+            image_count=image_count,
+            mode=pending.mode,
+        )
+        if not order:
+            order = await self._parse_order_adjustment_with_llm(
+                event=event,
+                instruction=instruction,
+                image_count=image_count,
+                mode=pending.mode,
+            )
+        if not order:
+            return None
+        return [image_paths[index - 1] for index in order if 1 <= index <= image_count]
+
+    async def _start_confirmed_edit_task(
+        self,
+        event: AstrMessageEvent,
+        pending: PendingEditConfirmation,
+    ) -> None:
+        image_paths = self._sanitize_image_paths(pending.image_paths)
+        if not image_paths:
+            raise ValueError("待处理图片已失效，请重新发送图片后再试。")
+
+        if pending.mode == "img2img":
+            request_image_paths = image_paths
+            mask_path = None
+            source = "img2img_confirmed"
+        else:
+            request_image_paths = [image_paths[0]]
+            mask_path = image_paths[1] if len(image_paths) > 1 else None
+            source = "edit_confirmed"
+
+        platform_context = self._get_platform_context(event)
+        if platform_context["allow_initial_reply"]:
+            chain = MessageChain().message("已确认  开始处理")
+            await self._send_message_chain(
+                unified_msg_origin=event.unified_msg_origin,
+                chain=chain,
+                source=source,
+                stage="confirm_accepted",
+                text_count=1,
+                image_count=0,
+            )
+
+        self._create_background_task(
+            self._run_edit_task(
+                unified_msg_origin=event.unified_msg_origin,
+                prompt=pending.prompt,
+                image_paths=request_image_paths,
+                mask_path=mask_path,
+                source=source,
+                platform_context=platform_context,
+            )
+        )
 
     @staticmethod
     def _normalize_error_message(message: str) -> str:
@@ -650,7 +1131,7 @@ class OpenAIImagePlugin(Star):
     async def _request_image_edit(
         self,
         prompt: str,
-        image_path: str,
+        image_paths: list[str],
         mask_path: str | None = None,
     ) -> dict[str, Any]:
         api_key = self._get_api_key()
@@ -659,8 +1140,11 @@ class OpenAIImagePlugin(Star):
             raise ValueError("未配置 API Key。请在插件配置中填写 api_key，或设置环境变量 OPENAI_API_KEY。")
         if not endpoint.startswith(("http://", "https://")):
             raise ValueError("base_url 必须以 http:// 或 https:// 开头，并建议填写到 /v1。")
-        if not os.path.exists(image_path):
+        if not image_paths:
             raise ValueError("未找到要编辑的原图文件。")
+        missing_images = [image_path for image_path in image_paths if not os.path.exists(image_path)]
+        if missing_images:
+            raise ValueError(f"未找到要编辑的原图文件：{missing_images[0]}")
         if mask_path and not os.path.exists(mask_path):
             raise ValueError("未找到修图遮罩文件。")
 
@@ -676,7 +1160,7 @@ class OpenAIImagePlugin(Star):
             f"OpenAIImage edit request endpoint={endpoint} model={payload.get('model')} size={payload.get('size')} "
             f"quality={payload.get('quality')} n={payload.get('n')} moderation={payload.get('moderation')} "
             f"timeout={generation_timeout}s retries={retry_count} proxy={proxy_url or 'none'} "
-            f"image={image_path} mask={mask_path or 'none'} prompt={prompt}",
+            f"image_count={len(image_paths)} images={image_paths} mask={mask_path or 'none'} prompt={prompt}",
         )
 
         for attempt in range(1, total_attempts + 1):
@@ -686,31 +1170,25 @@ class OpenAIImagePlugin(Star):
                 form.add_field(key, str(value))
 
             try:
-                with open(image_path, "rb") as image_file:
-                    form.add_field(
-                        "image",
-                        image_file,
-                        filename=os.path.basename(image_path),
-                        content_type=self._guess_mime_type_from_path(image_path),
-                    )
+                image_field_name = "image[]" if len(image_paths) > 1 else "image"
+                with contextlib.ExitStack() as stack:
+                    for image_path in image_paths:
+                        image_file = stack.enter_context(open(image_path, "rb"))
+                        form.add_field(
+                            image_field_name,
+                            image_file,
+                            filename=os.path.basename(image_path),
+                            content_type=self._guess_mime_type_from_path(image_path),
+                        )
                     if mask_path:
-                        with open(mask_path, "rb") as mask_file:
-                            form.add_field(
-                                "mask",
-                                mask_file,
-                                filename=os.path.basename(mask_path),
-                                content_type=self._guess_mime_type_from_path(mask_path),
-                            )
-                            async with session.post(
-                                endpoint,
-                                headers=headers,
-                                data=form,
-                                **self._build_request_kwargs(generation_timeout),
-                            ) as response:
-                                text = await response.text()
-                                data = self._parse_json_response_text(text)
-                    else:
-                        async with session.post(
+                        mask_file = stack.enter_context(open(mask_path, "rb"))
+                        form.add_field(
+                            "mask",
+                            mask_file,
+                            filename=os.path.basename(mask_path),
+                            content_type=self._guess_mime_type_from_path(mask_path),
+                        )
+                    async with session.post(
                             endpoint,
                             headers=headers,
                             data=form,
@@ -989,7 +1467,7 @@ class OpenAIImagePlugin(Star):
         self,
         unified_msg_origin: str,
         prompt: str,
-        image_path: str,
+        image_paths: list[str],
         mask_path: str | None,
         source: str,
         platform_context: dict[str, Any],
@@ -1000,10 +1478,11 @@ class OpenAIImagePlugin(Star):
             try:
                 logger.info(
                     f"OpenAIImage edit request source={source} platform={platform_context['platform_name']} "
-                    f"platform_id={platform_context['platform_id']} image={image_path} mask={mask_path or 'none'} "
+                    f"platform_id={platform_context['platform_id']} image_count={len(image_paths)} "
+                    f"images={image_paths} mask={mask_path or 'none'} "
                     f"prompt={prompt}"
                 )
-                response = await self._request_image_edit(prompt, image_path=image_path, mask_path=mask_path)
+                response = await self._request_image_edit(prompt, image_paths=image_paths, mask_path=mask_path)
                 await self._send_success_response(
                     unified_msg_origin=unified_msg_origin,
                     response=response,
@@ -1085,6 +1564,7 @@ class OpenAIImagePlugin(Star):
         initial_reply_text: str | None = None,
         final_preamble_texts: list[str] | None = None,
         use_mask: bool = False,
+        use_all_images: bool = False,
         polished_prompt: str | None = None,
     ) -> str | None:
         final_prompt = self._compose_prompt(prompt)
@@ -1095,7 +1575,7 @@ class OpenAIImagePlugin(Star):
         if not input_images:
             raise ValueError("请在同一条消息里附带至少一张图片，再使用图生图或修图命令。")
 
-        source_image_path = input_images[0]
+        source_image_paths = input_images if use_all_images else [input_images[0]]
         mask_image_path = input_images[1] if use_mask and len(input_images) > 1 else None
         platform_context = self._get_platform_context(event)
         send_initial_reply = bool(initial_reply_text and platform_context["allow_initial_reply"])
@@ -1107,13 +1587,14 @@ class OpenAIImagePlugin(Star):
             "info",
             f"OpenAIImage queue edit source={source} platform={platform_context['platform_name']} "
             f"send_initial_reply={send_initial_reply} final_preamble_count={len(effective_final_preamble_texts)} "
-            f"image={source_image_path} mask={mask_image_path or 'none'} prompt={final_prompt}",
+            f"image_count={len(source_image_paths)} images={source_image_paths} "
+            f"mask={mask_image_path or 'none'} prompt={final_prompt}",
         )
         self._create_background_task(
             self._run_edit_task(
                 unified_msg_origin=event.unified_msg_origin,
                 prompt=final_prompt,
-                image_path=source_image_path,
+                image_paths=source_image_paths,
                 mask_path=mask_image_path,
                 source=source,
                 platform_context=platform_context,
@@ -1146,43 +1627,97 @@ class OpenAIImagePlugin(Star):
 
     @filter.command("图生图", alias={"img2img", "image2image"})
     async def image_to_image(self, event: AstrMessageEvent, prompt: str = ""):
-        """基于用户附带的原图生成新图片。"""
+        """基于用户先发送的一张或多张图片生成新图片。第一张为主图，后续图片为参考图。"""
         command_prompt = self._extract_command_prompt(event, prompt)
         if not command_prompt:
-            yield event.plain_result("请输入修改要求，并在同一条消息里附带原图，例如：/图生图 改成吉卜力动画风")
+            yield event.plain_result("请先发图片  再发  /图生图 修改要求")
             return
 
         try:
-            initial_reply = await self._queue_edit_task(
+            await self._queue_edit_confirmation(
                 event=event,
                 prompt=command_prompt,
+                mode="img2img",
                 source="img2img_command",
-                initial_reply_text="正在根据原图生成图片，请稍等……",
             )
         except ValueError as exc:
             yield event.plain_result(str(exc))
             return
-        if initial_reply:
-            yield event.plain_result(initial_reply)
+        event.stop_event()
 
     @filter.command("修图", alias={"改图", "edit", "inpaint"})
     async def edit_image(self, event: AstrMessageEvent, prompt: str = ""):
-        """基于用户附带的原图进行修图。第二张图片会被当作遮罩使用。"""
+        """基于用户先发送的原图进行修图。第二张图片会被当作遮罩使用。"""
         command_prompt = self._extract_command_prompt(event, prompt)
         if not command_prompt:
-            yield event.plain_result("请输入修图要求，并在同一条消息里附带原图，例如：/修图 去掉背景里的路人")
+            yield event.plain_result("请先发图  再发  /修图 修改要求")
             return
 
         try:
-            initial_reply = await self._queue_edit_task(
+            await self._queue_edit_confirmation(
                 event=event,
                 prompt=command_prompt,
+                mode="edit",
                 source="edit_command",
-                initial_reply_text="正在修图，请稍等……",
-                use_mask=True,
             )
         except ValueError as exc:
             yield event.plain_result(str(exc))
             return
-        if initial_reply:
-            yield event.plain_result(initial_reply)
+        event.stop_event()
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=1)
+    async def handle_pending_edit_confirmation(self, event: AstrMessageEvent):
+        normalized_text = self._normalize_message_text(str(event.message_str or ""))
+        input_images = await self._extract_input_images(event)
+        pending = self._get_pending_confirmation(event)
+
+        if pending:
+            if self._is_known_command_text(normalized_text):
+                return
+
+            if input_images and not normalized_text:
+                yield event.plain_result("当前有待确认的任务  回复 确认  取消  或直接说怎么调顺序")
+                event.stop_event()
+                return
+
+            if not normalized_text:
+                return
+
+            if self._is_confirm_reply(normalized_text):
+                self._clear_pending_confirmation(event)
+                try:
+                    await self._start_confirmed_edit_task(event, pending)
+                except ValueError as exc:
+                    yield event.plain_result(str(exc))
+                event.stop_event()
+                return
+
+            if self._is_cancel_reply(normalized_text):
+                self._clear_pending_confirmation(event)
+                self._clear_staged_images(event)
+                yield event.plain_result("已取消  这次不处理了")
+                event.stop_event()
+                return
+
+            updated_image_paths = await self._resolve_adjusted_image_paths(
+                event=event,
+                pending=pending,
+                instruction=normalized_text,
+            )
+            if not updated_image_paths:
+                yield event.plain_result("没看懂  可以直接说  把第二张放第一张前面  或回复 确认 取消")
+                event.stop_event()
+                return
+
+            pending.image_paths = updated_image_paths
+            self._set_pending_confirmation(event, pending)
+            await self._send_confirmation_preview(event, pending, source=f"{pending.mode}_confirm_adjust")
+            event.stop_event()
+            return
+
+        if input_images and not normalized_text and not self._is_known_command_text(normalized_text):
+            self._stage_images(event, input_images)
+            return
+
+        if normalized_text and not self._is_known_command_text(normalized_text):
+            self._clear_staged_images(event)
